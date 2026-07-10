@@ -1,0 +1,1344 @@
+#!/usr/bin/env python3
+"""ticky: one-command setup of named, cross-platform subagents for a boss LLM.
+
+Zero dependencies (Python stdlib only). One file. It is three things at once:
+  1. a setup wizard      (ticky init / add / prefs / key / install)
+  2. an MCP stdio server (ticky serve) exposing one tool per named agent
+  3. a call logger        (ticky log) feeding the ticky widget (ticky widget)
+
+The core (serve/init/add/log/call) is platform-neutral; everything that only
+exists on one OS (the compiled status widget, launchd, Keychain probing) is
+gated behind platform checks so the rest works anywhere Python does.
+
+Config lives in ~/.ticky/config.json, secrets in ~/.ticky/env (0600),
+call history in ~/.ticky/calls.jsonl, live state in ~/.ticky/state.json.
+"""
+
+import argparse
+import contextlib
+import getpass
+import json
+import os
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime, timezone
+
+try:
+    import fcntl
+except ImportError:  # Windows fallback; thread locking still protects one process.
+    fcntl = None
+
+VERSION = "0.3.0"
+PROTOCOL_FALLBACK = "2025-06-18"
+
+IS_MAC = sys.platform == "darwin"
+WIDGET_UNSUPPORTED_MSG = (
+    "the ticky widget currently ships only for macOS; Windows and Linux tray "
+    "widgets are planned. `ticky log -f` gives the same live view in any terminal."
+)
+
+TICKY_HOME = os.path.expanduser(os.environ.get("TICKY_HOME", "~/.ticky"))
+CONFIG_PATH = os.path.join(TICKY_HOME, "config.json")
+ENV_PATH = os.path.join(TICKY_HOME, "env")
+LOG_PATH = os.path.join(TICKY_HOME, "calls.jsonl")
+STATE_PATH = os.path.join(TICKY_HOME, "state.json")
+STATE_LOCK_PATH = os.path.join(TICKY_HOME, "state.lock")
+BIN_DIR = os.path.join(TICKY_HOME, "bin")
+WIDGET_BIN = os.path.join(BIN_DIR, "ticky-widget")
+WIDGET_SRC = os.path.join(os.path.dirname(os.path.realpath(__file__)), "widget", "macos", "TickyWidget.swift")
+LAUNCH_AGENT = os.path.expanduser("~/Library/LaunchAgents/fun.ticky.widget.plist")  # macOS only
+
+ACCESS_LEVELS = ("read-only", "workspace-write", "full")
+BACKENDS = ("codex", "claude", "mock")
+
+DEFAULT_PREFS = (
+    "ChatGPT credits are ample and Claude tokens are scarcer: when a task fits "
+    "more than one agent, prefer the codex-backed ones (Rook, Wren) over the "
+    "claude-backed one (Finch). Lower priority number means call first. Always "
+    "pass a specific one-line reason; it is logged and shown in the ticky widget."
+)
+
+DEFAULT_AGENTS = [
+    {
+        "name": "rook",
+        "display": "Rook",
+        "backend": "codex",
+        "model": None,
+        "specialty": "Deep reasoning: audits, math, second opinions on plans, tricky debugging analysis.",
+        "routing_note": "Call Rook first for anything analytical or verification-shaped.",
+        "priority": 1,
+        "access": "read-only",
+        "workdir": "~",
+        "network": False,
+        "timeout": 900,
+        "enabled": True,
+        "extra_args": [],
+    },
+    {
+        "name": "wren",
+        "display": "Wren",
+        "backend": "codex",
+        "model": None,
+        "specialty": "Research, reading long documents, summarization, and drafting prose or docs.",
+        "routing_note": "Call Wren for research and writing tasks.",
+        "priority": 1,
+        "access": "read-only",
+        "workdir": "~",
+        "network": False,
+        "timeout": 900,
+        "enabled": True,
+        "extra_args": [],
+    },
+    {
+        "name": "finch",
+        "display": "Finch",
+        "backend": "claude",
+        "model": None,
+        "specialty": "Hands-on coding: multi-file edits, running builds and tests, agentic tool work inside a repo.",
+        "routing_note": "Call Finch when files actually need to change.",
+        "priority": 2,
+        "access": "workspace-write",
+        "workdir": "~",
+        "network": False,
+        "timeout": 900,
+        "enabled": True,
+        "extra_args": [],
+    },
+]
+
+
+# ---------------------------------------------------------------- utilities
+
+def ensure_home():
+    os.makedirs(TICKY_HOME, exist_ok=True)
+    os.makedirs(BIN_DIR, exist_ok=True)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def save_config(cfg):
+    ensure_home()
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, CONFIG_PATH)
+
+
+def require_config():
+    cfg = load_config()
+    if cfg is None:
+        die("no config found; run `ticky init` first")
+    return cfg
+
+
+def get_agent(cfg, name):
+    for a in cfg["agents"]:
+        if a["name"] == name.lower():
+            return a
+    return None
+
+
+def die(msg, code=1):
+    print(f"ticky: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_env_file():
+    """API keys etc. from ~/.ticky/env, KEY=value per line."""
+    env = {}
+    try:
+        with open(ENV_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return env
+
+
+def child_env():
+    """Environment for backend subprocesses: inherit, overlay ~/.ticky/env,
+    drop vars that mark this process as nested inside a Claude Code session."""
+    env = dict(os.environ)
+    for k in list(env):
+        if k == "CLAUDECODE" or k.startswith("CLAUDE_CODE_"):
+            env.pop(k)
+    env.update(load_env_file())
+    return env
+
+
+def append_log(entry):
+    ensure_home()
+    with open(LOG_PATH, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def read_log_tail(n=20):
+    try:
+        with open(LOG_PATH, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            lines = f.read().decode("utf-8", "replace").strip().splitlines()
+    except FileNotFoundError:
+        return []
+    out = []
+    for line in lines[-n:]:
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    return out
+
+
+_state_lock = threading.Lock()
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def write_state(running, owner=None):
+    """Publish one process's calls without erasing calls from other MCP sessions."""
+    ensure_home()
+    owner = owner or f"process-{os.getpid()}"
+    with _state_lock:
+        with open(STATE_LOCK_PATH, "a+") as lock_file:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                try:
+                    with open(STATE_PATH) as f:
+                        state = json.load(f)
+                except (FileNotFoundError, json.JSONDecodeError, OSError):
+                    state = {}
+
+                owners = state.get("owners") if isinstance(state.get("owners"), dict) else {}
+                owners = {
+                    key: value for key, value in owners.items()
+                    if isinstance(value, dict) and _pid_alive(value.get("pid"))
+                }
+                if running:
+                    owners[owner] = {"pid": os.getpid(), "running": running}
+                else:
+                    owners.pop(owner, None)
+
+                combined = []
+                for value in owners.values():
+                    calls = value.get("running")
+                    if isinstance(calls, list):
+                        combined.extend(calls)
+
+                tmp = STATE_PATH + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump({"running": combined, "owners": owners, "updated": now_iso()}, f)
+                os.replace(tmp, STATE_PATH)
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+# ------------------------------------------------------------ backend calls
+
+def build_prompt(agent, task, context):
+    parts = [
+        f"You are {agent['display']}, a subagent dispatched by a boss LLM via ticky.",
+        f"Specialty: {agent['specialty']}",
+        "Complete the task and reply with the result only; the boss reads your last message.",
+        "",
+        f"TASK: {task}",
+    ]
+    if context:
+        parts += ["", f"CONTEXT FROM BOSS: {context}"]
+    return "\n".join(parts)
+
+
+def codex_cmd(agent, prompt, out_file):
+    access = {"read-only": "read-only", "workspace-write": "workspace-write", "full": "danger-full-access"}[agent["access"]]
+    cmd = [
+        "codex", "exec",
+        "--skip-git-repo-check",
+        "-s", access,
+        "-C", os.path.expanduser(agent.get("workdir") or "~"),
+        "-o", out_file,
+    ]
+    if agent.get("network") and agent["access"] == "workspace-write":
+        cmd += ["-c", "sandbox_workspace_write.network_access=true"]
+    if agent.get("model"):
+        cmd += ["-m", agent["model"]]
+    cmd += agent.get("extra_args", [])
+    cmd.append(prompt)
+    return cmd
+
+
+def claude_cmd(agent, prompt):
+    cmd = ["claude", "-p", prompt, "--output-format", "text"]
+    access = agent["access"]
+    if access == "read-only":
+        cmd += ["--allowedTools", "Read Glob Grep WebFetch WebSearch TodoWrite",
+                "--disallowedTools", "Bash Edit Write NotebookEdit"]
+    elif access == "workspace-write":
+        # No OS sandbox here: Bash stays blocked so "workspace-write" means file
+        # edits via Edit/Write only. Use access=full for Bash.
+        cmd += ["--permission-mode", "acceptEdits",
+                "--allowedTools", "Read Glob Grep WebFetch WebSearch TodoWrite Edit Write NotebookEdit",
+                "--disallowedTools", "Bash"]
+    else:
+        cmd += ["--dangerously-skip-permissions"]
+    if agent.get("model"):
+        cmd += ["--model", agent["model"]]
+    cmd += agent.get("extra_args", [])
+    return cmd
+
+
+def run_agent(agent, task, context=None):
+    """Run one backend call. Returns (ok, text, duration_seconds)."""
+    prompt = build_prompt(agent, task, context)
+    timeout = int(agent.get("timeout") or 900)
+    start = time.monotonic()
+
+    if agent["backend"] == "mock":
+        return True, f"[mock:{agent['name']}] task received: {task}", 0.0
+
+    out_file = None
+    if agent["backend"] == "codex":
+        fd, out_file = tempfile.mkstemp(prefix="ticky-", suffix=".md")
+        os.close(fd)
+        cmd = codex_cmd(agent, prompt, out_file)
+    elif agent["backend"] == "claude":
+        cmd = claude_cmd(agent, prompt)
+    else:
+        return False, f"unknown backend {agent['backend']!r}", 0.0
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            cwd=os.path.expanduser(agent.get("workdir") or "~"),
+            env=child_env(),
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as error:
+        if out_file:
+            with contextlib.suppress(OSError):
+                os.unlink(out_file)
+        return False, f"could not start backend {cmd[0]!r}: {error}", 0.0
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if hasattr(os, "killpg"):  # POSIX: kill the whole process group
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            proc.kill()
+        proc.wait()
+        return False, f"timed out after {timeout}s", time.monotonic() - start
+
+    duration = time.monotonic() - start
+    text = ""
+    if out_file:
+        try:
+            with open(out_file) as f:
+                text = f.read().strip()
+        finally:
+            try:
+                os.unlink(out_file)
+            except OSError:
+                pass
+    if not text:
+        text = (stdout or "").strip()
+
+    if proc.returncode != 0:
+        err = (stderr or "").strip()
+        detail = text or err or "no output"
+        return False, f"backend exited {proc.returncode}: {detail[-2000:]}", duration
+    if not text:
+        return False, "backend produced no output", duration
+    return True, text, duration
+
+
+# ------------------------------------------------------------- MCP server
+
+def tool_name(agent):
+    return f"ask_{agent['name']}"
+
+
+def tool_def(agent):
+    model = f"/{agent['model']}" if agent.get("model") else ""
+    desc = (
+        f"{agent['display']} ({agent['backend']}{model} subagent). {agent['specialty']} "
+        f"{agent.get('routing_note', '')} Priority {agent['priority']} (lower = prefer first). "
+        f"Access: {agent['access']}, workdir: {agent.get('workdir', '~')}. "
+        f"Runs synchronously and returns the agent's final answer."
+    )
+    return {
+        "name": tool_name(agent),
+        "description": desc,
+        "annotations": {"readOnlyHint": agent["access"] == "read-only"},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The complete, self-contained task. The subagent has no other context.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "One line: why this agent for this task. Logged and shown in the ticky widget.",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional extra context: file paths, constraints, prior findings.",
+                },
+            },
+            "required": ["task", "reason"],
+        },
+    }
+
+
+def roster_tool_def():
+    return {
+        "name": "ticky_roster",
+        "description": (
+            "List the available ticky subagents with their specialties, priorities, "
+            "access levels, and recent usage. Call this when unsure which agent fits."
+        ),
+        "annotations": {"readOnlyHint": True},
+        "inputSchema": {"type": "object", "properties": {}},
+    }
+
+
+def roster_text(cfg):
+    lines = [f"ticky roster ({len([a for a in cfg['agents'] if a.get('enabled', True)])} agents). "
+             f"Global preferences: {cfg.get('preferences', '(none)')}", ""]
+    for a in sorted(cfg["agents"], key=lambda a: a["priority"]):
+        if not a.get("enabled", True):
+            continue
+        model = f"/{a['model']}" if a.get("model") else ""
+        lines.append(
+            f"- {a['display']} (tool {tool_name(a)}, {a['backend']}{model}, priority {a['priority']}, "
+            f"access {a['access']}, workdir {a.get('workdir', '~')}): {a['specialty']} {a.get('routing_note', '')}"
+        )
+    recent = read_log_tail(5)
+    if recent:
+        lines += ["", "Recent calls:"]
+        for e in recent:
+            lines.append(f"- {e.get('ts')} {e.get('agent')} [{e.get('status')}] {e.get('reason', '')}")
+    return "\n".join(lines)
+
+
+class McpServer:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.out_lock = threading.Lock()
+        self.running = {}  # id -> {agent, reason, started}
+        self.run_lock = threading.Lock()
+        self.workers = []
+        self.boss = "unknown"
+        self.state_owner = f"serve-{os.getpid()}"
+
+    def dbg(self, direction, text):
+        # wire tracing, enabled by `touch ~/.ticky/debug`
+        if not os.path.exists(os.path.join(TICKY_HOME, "debug")):
+            return
+        try:
+            with open(os.path.join(TICKY_HOME, "server-debug.log"), "a") as f:
+                f.write(f"{now_iso()} {direction} {text}\n")
+        except OSError:
+            pass
+
+    def send(self, msg):
+        with self.out_lock:
+            out = json.dumps(msg)
+            self.dbg(">>", out)
+            sys.stdout.write(out + "\n")
+            sys.stdout.flush()
+
+    def reply(self, req_id, result):
+        self.send({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+    def reply_err(self, req_id, code, message):
+        self.send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
+
+    def publish_state(self):
+        with self.run_lock:
+            running = list(self.running.values())
+        write_state(running, self.state_owner)
+
+    def handle_call(self, req_id, params):
+        name = params.get("name", "")
+        args = params.get("arguments") or {}
+        if name == "ticky_roster":
+            self.reply(req_id, {"content": [{"type": "text", "text": roster_text(self.cfg)}], "isError": False})
+            return
+
+        agent = None
+        for a in self.cfg["agents"]:
+            if tool_name(a) == name and a.get("enabled", True):
+                agent = a
+                break
+        if agent is None:
+            self.reply_err(req_id, -32602, f"unknown tool {name!r}")
+            return
+
+        task = args.get("task") or ""
+        reason = args.get("reason") or "(no reason given)"
+        context = args.get("context")
+        if not task.strip():
+            self.reply(req_id, {"content": [{"type": "text", "text": "error: empty task"}], "isError": True})
+            return
+
+        key = f"{req_id}-{time.time()}"
+        with self.run_lock:
+            self.running[key] = {"agent": agent["display"], "reason": reason, "started": now_iso()}
+        self.publish_state()
+
+        try:
+            ok, text, duration = run_agent(agent, task, context)
+        except Exception as error:
+            ok, text, duration = False, f"backend failed unexpectedly: {error}", 0.0
+        finally:
+            with self.run_lock:
+                self.running.pop(key, None)
+            self.publish_state()
+
+        append_log({
+            "ts": now_iso(),
+            "boss": self.boss,
+            "agent": agent["display"],
+            "backend": agent["backend"],
+            "reason": reason,
+            "task_preview": task[:200],
+            "status": "ok" if ok else "error",
+            "duration_s": round(duration, 1),
+            "chars": len(text),
+        })
+        self.reply(req_id, {"content": [{"type": "text", "text": text}], "isError": not ok})
+
+    def handle(self, msg):
+        method = msg.get("method")
+        req_id = msg.get("id")
+        params = msg.get("params") or {}
+
+        if method == "initialize":
+            client = params.get("clientInfo") or {}
+            self.boss = client.get("name", "unknown")
+            proto = params.get("protocolVersion") or PROTOCOL_FALLBACK
+            enabled = [a for a in self.cfg["agents"] if a.get("enabled", True)]
+            names = ", ".join(f"{a['display']} ({tool_name(a)})" for a in sorted(enabled, key=lambda a: a["priority"]))
+            self.reply(req_id, {
+                "protocolVersion": proto,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "ticky", "version": VERSION},
+                "instructions": (
+                    f"ticky gives you named subagents: {names}. "
+                    f"Routing preferences: {self.cfg.get('preferences', '(none)')} "
+                    "Every call needs a one-line `reason`; it is logged and shown to the user "
+                    "in the ticky widget. Tasks must be self-contained; subagents share no context with you."
+                ),
+            })
+        elif method == "notifications/initialized":
+            pass
+        elif method == "ping":
+            self.reply(req_id, {})
+        elif method == "tools/list":
+            tools = [tool_def(a) for a in sorted(self.cfg["agents"], key=lambda a: a["priority"])
+                     if a.get("enabled", True)]
+            tools.append(roster_tool_def())
+            self.reply(req_id, {"tools": tools})
+        elif method == "tools/call":
+            t = threading.Thread(target=self.handle_call, args=(req_id, params), daemon=True)
+            self.workers.append(t)
+            t.start()
+        elif req_id is not None:
+            self.reply_err(req_id, -32601, f"method {method!r} not supported")
+        # notifications for unsupported methods are silently ignored
+
+    def serve(self):
+        write_state([], self.state_owner)
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            self.dbg("<<", line)
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(msg, list):  # JSON-RPC batch
+                for m in msg:
+                    try:
+                        self.handle(m)
+                    except Exception as e:
+                        if isinstance(m, dict) and m.get("id") is not None:
+                            self.reply_err(m["id"], -32603, f"internal error: {e}")
+                continue
+            try:
+                self.handle(msg)
+            except Exception as e:  # keep the server alive no matter what
+                if msg.get("id") is not None:
+                    self.reply_err(msg["id"], -32603, f"internal error: {e}")
+        for t in self.workers:  # stdin closed: finish in-flight calls before exiting
+            t.join()
+        write_state([], self.state_owner)
+
+
+def cmd_serve(_args):
+    cfg = require_config()
+    McpServer(cfg).serve()
+
+
+# ----------------------------------------------------------- auth detection
+
+def detect_backends():
+    """Returns {backend: {installed, auth, detail}}."""
+    envs = child_env()
+    out = {}
+
+    claude_path = shutil.which("claude")
+    auth = False
+    detail = "not installed"
+    if claude_path:
+        detail = "installed, auth not detected"
+        if envs.get("ANTHROPIC_API_KEY"):
+            auth, detail = True, "API key (ANTHROPIC_API_KEY)"
+        elif os.path.exists(os.path.expanduser("~/.claude/.credentials.json")):
+            auth, detail = True, "subscription login"
+        elif IS_MAC:  # credentials can also live in the macOS Keychain
+            r = subprocess.run(
+                ["security", "find-generic-password", "-s", "Claude Code-credentials"],
+                capture_output=True,
+            )
+            if r.returncode == 0:
+                auth, detail = True, "subscription login (Keychain)"
+    out["claude"] = {"installed": bool(claude_path), "auth": auth, "detail": detail}
+
+    codex_path = shutil.which("codex")
+    auth = False
+    detail = "not installed"
+    if codex_path:
+        detail = "installed, auth not detected"
+        if envs.get("OPENAI_API_KEY"):
+            auth, detail = True, "API key (OPENAI_API_KEY)"
+        elif os.path.exists(os.path.expanduser("~/.codex/auth.json")):
+            auth, detail = True, "subscription login (ChatGPT)"
+    out["codex"] = {"installed": bool(codex_path), "auth": auth, "detail": detail}
+    return out
+
+
+# -------------------------------------------------------------- widget mgmt
+# Everything below this banner is the macOS frontend (Swift menu bar app,
+# launchd). Ports live in widget/<platform>/ and get their own branch here.
+
+def widget_build():
+    if not IS_MAC:
+        die(WIDGET_UNSUPPORTED_MSG)
+    ensure_home()
+    if not os.path.exists(WIDGET_SRC):
+        die(f"widget source not found at {WIDGET_SRC}")
+    r = subprocess.run(["swiftc", "-O", WIDGET_SRC, "-o", WIDGET_BIN], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"widget build failed:\n{r.stderr}")
+    print(f"built {WIDGET_BIN}")
+
+
+WIDGET_LABEL = "fun.ticky.widget"
+
+
+def widget_pids():
+    if not IS_MAC:
+        return []
+    # pgrep finds candidate processes by executable name. Then filter by the
+    # exact installed binary so alternate TICKY_HOME test runs do not see or
+    # stop the user's live widget.
+    r = subprocess.run(["pgrep", "-x", "ticky-widget"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return []
+    matches = []
+    for raw_pid in r.stdout.split():
+        pid = int(raw_pid)
+        proc = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                              capture_output=True, text=True)
+        command = proc.stdout.strip()
+        if command == WIDGET_BIN or command.startswith(WIDGET_BIN + " "):
+            matches.append(pid)
+    return matches
+
+
+def widget_start():
+    if not os.path.exists(WIDGET_BIN):
+        widget_build()
+    if widget_pids():
+        print("widget already running")
+        return
+    # Prefer launchd ownership: a raw child process dies with whatever shell
+    # session spawned it, a bootstrapped service does not.
+    if os.path.exists(LAUNCH_AGENT):
+        domain = f"gui/{os.getuid()}"
+        subprocess.run(["launchctl", "bootstrap", domain, LAUNCH_AGENT],
+                       capture_output=True)  # errors if already loaded; fine
+        subprocess.run(["launchctl", "kickstart", f"{domain}/{WIDGET_LABEL}"],
+                       capture_output=True)
+        time.sleep(0.8)
+        if widget_pids():
+            print("widget running (menu bar, launchd-managed)")
+            return
+    subprocess.Popen([WIDGET_BIN], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     stdin=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(0.8)
+    if widget_pids():
+        print("widget running (menu bar)")
+    else:
+        die("widget failed to stay up; try running it directly: " + WIDGET_BIN)
+
+
+def widget_stop():
+    was_running = bool(widget_pids())
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{WIDGET_LABEL}"],
+                   capture_output=True)  # unloads if launchd-managed; else no-op
+    for p in widget_pids():
+        try:
+            os.kill(p, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    print("widget stopped" if was_running else "widget not running")
+
+
+def widget_login_enable():
+    os.makedirs(os.path.dirname(LAUNCH_AGENT), exist_ok=True)
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{WIDGET_LABEL}</string>
+  <key>ProgramArguments</key><array><string>{WIDGET_BIN}</string></array>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+"""
+    with open(LAUNCH_AGENT, "w") as f:
+        f.write(plist)
+    print(f"login item written: {LAUNCH_AGENT}")
+
+
+def cmd_setup(_args):
+    """Open the native setup window (backends, agents, models, preferences)."""
+    if not IS_MAC:
+        die(WIDGET_UNSUPPORTED_MSG + " Edit ~/.ticky/config.json directly, or use "
+            "`ticky add` / `ticky edit` / `ticky prefs`.")
+    ensure_home()
+    widget_start()
+    # the widget polls for this flag once a second and opens the setup window
+    with open(os.path.join(TICKY_HOME, "open-setup"), "w"):
+        pass
+    print("setup window opening (ticky widget)")
+
+
+def cmd_widget(args):
+    if not IS_MAC:
+        if (args.action or "start") == "status":
+            print("widget: unavailable on this platform")
+            return
+        die(WIDGET_UNSUPPORTED_MSG)
+    action = args.action or "start"
+    if action == "build":
+        widget_build()
+    elif action == "start":
+        widget_start()
+    elif action == "stop":
+        widget_stop()
+    elif action == "restart":
+        widget_stop()
+        time.sleep(0.5)
+        widget_start()
+    elif action == "login":
+        widget_login_enable()
+    elif action == "status":
+        pids = widget_pids()
+        print(f"widget: {'running (pid ' + str(pids[0]) + ')' if pids else 'not running'}")
+
+
+# ------------------------------------------------------------ registration
+
+def self_path():
+    return os.path.realpath(__file__)
+
+
+def codex_set_auto_approval():
+    """codex exec has no user to answer tool-approval prompts, so unapproved MCP
+    calls die as 'user cancelled'. Set default_tools_approval_mode = "approve"
+    for the ticky server ("auto" only clears readOnlyHint tools). Text edit
+    (stdlib has no TOML writer), validated with tomllib before writing."""
+    import tomllib
+    path = os.path.expanduser("~/.codex/config.toml")
+    try:
+        with open(path) as f:
+            text = f.read()
+    except FileNotFoundError:
+        return False
+    out, in_section, done = [], False, False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if in_section and stripped.startswith("[") and stripped != "[mcp_servers.ticky]":
+            in_section = False
+        if in_section and stripped.startswith("default_tools_approval_mode"):
+            continue  # drop any existing value; the fresh one is already inserted
+        out.append(line)
+        if stripped == "[mcp_servers.ticky]":
+            in_section = True
+            out.append('default_tools_approval_mode = "approve"')
+            done = True
+    if not done:
+        return False
+    new_text = "\n".join(out) + "\n"
+    try:
+        tomllib.loads(new_text)
+    except tomllib.TOMLDecodeError:
+        return False
+    with open(path, "w") as f:
+        f.write(new_text)
+    return True
+
+
+def cmd_install(args):
+    targets = [args.target] if args.target and args.target != "all" else ["claude", "codex"]
+    for t in targets:
+        if t == "claude":
+            if not shutil.which("claude"):
+                print("claude CLI not found, skipping")
+                continue
+            subprocess.run(["claude", "mcp", "remove", "--scope", "user", "ticky"],
+                           capture_output=True)
+            r = subprocess.run(
+                ["claude", "mcp", "add", "--scope", "user", "ticky", "--", self_path(), "serve"],
+                capture_output=True, text=True)
+            print(("claude: registered ticky (user scope)" if r.returncode == 0
+                   else f"claude: register failed: {r.stderr.strip()}"))
+        elif t == "codex":
+            if not shutil.which("codex"):
+                print("codex CLI not found, skipping")
+                continue
+            subprocess.run(["codex", "mcp", "remove", "ticky"], capture_output=True)
+            r = subprocess.run(["codex", "mcp", "add", "ticky", "--", self_path(), "serve"],
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                approved = codex_set_auto_approval()
+                print("codex: registered ticky" +
+                      (" (tools auto-approved)" if approved else
+                       '; could not set auto-approval, add default_tools_approval_mode = "approve" '
+                       "under [mcp_servers.ticky] in ~/.codex/config.toml"))
+            else:
+                print(f"codex: register failed: {r.stderr.strip()}")
+        else:
+            die(f"unknown install target {t!r}")
+
+
+def cmd_uninstall(args):
+    targets = [args.target] if args.target and args.target != "all" else ["claude", "codex"]
+    for t in targets:
+        if t == "claude" and shutil.which("claude"):
+            subprocess.run(["claude", "mcp", "remove", "--scope", "user", "ticky"], capture_output=True)
+            print("claude: removed ticky")
+        elif t == "codex" and shutil.which("codex"):
+            subprocess.run(["codex", "mcp", "remove", "ticky"], capture_output=True)
+            print("codex: removed ticky")
+
+
+def symlink_to_path():
+    dest = os.path.expanduser("~/.local/bin/ticky")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    src = self_path()
+    if os.path.islink(dest) or os.path.exists(dest):
+        try:
+            if os.path.realpath(dest) == src:
+                return dest
+            os.unlink(dest)
+        except OSError:
+            return None
+    try:
+        os.symlink(src, dest)
+        return dest
+    except OSError:
+        return None
+
+
+# ----------------------------------------------------------------- wizard
+
+def prompt_str(label, default=None):
+    suffix = f" [{default}]" if default is not None else ""
+    val = input(f"  {label}{suffix}: ").strip()
+    return val or (default if default is not None else "")
+
+
+def prompt_choice(label, choices, default):
+    while True:
+        val = prompt_str(f"{label} ({'/'.join(choices)})", default)
+        if val in choices:
+            return val
+        print(f"  pick one of: {', '.join(choices)}")
+
+
+def cmd_init(args):
+    ensure_home()
+    existing = load_config()
+    if existing and not args.yes:
+        keep = prompt_choice("config exists; keep existing agents", ["keep", "reset"], "keep")
+        if keep == "keep":
+            cfg = existing
+        else:
+            cfg = {"version": 1, "preferences": DEFAULT_PREFS, "agents": [dict(a) for a in DEFAULT_AGENTS]}
+    elif existing:
+        cfg = existing
+    else:
+        cfg = {"version": 1, "preferences": DEFAULT_PREFS, "agents": [dict(a) for a in DEFAULT_AGENTS]}
+
+    backends = detect_backends()
+    print("ticky init")
+    print("----------")
+    for b in ("codex", "claude"):
+        info = backends[b]
+        mark = "ok" if info["auth"] else ("found" if info["installed"] else "missing")
+        print(f"  {b:7s} [{mark}] {info['detail']}")
+
+    dropped = []
+    for a in list(cfg["agents"]):
+        b = backends.get(a["backend"], {})
+        if a["backend"] != "mock" and not b.get("installed"):
+            a["enabled"] = False
+            dropped.append(a["display"])
+    if dropped:
+        print(f"  disabled (backend missing): {', '.join(dropped)}")
+
+    for b in ("codex", "claude"):
+        info = backends[b]
+        if info["installed"] and not info["auth"]:
+            key = "OPENAI_API_KEY" if b == "codex" else "ANTHROPIC_API_KEY"
+            login = "codex login" if b == "codex" else "claude (then /login)"
+            print(f"  note: {b} has no detectable auth. Either run `{login}` or `ticky key set {key}`.")
+
+    save_config(cfg)
+    print(f"  config: {CONFIG_PATH} ({len([a for a in cfg['agents'] if a.get('enabled', True)])} agents enabled)")
+
+    link = symlink_to_path()
+    if link:
+        print(f"  on PATH: {link}")
+
+    if not args.no_install:
+        cmd_install(argparse.Namespace(target="all"))
+    if not args.no_widget:
+        if IS_MAC:
+            widget_build()
+            widget_login_enable()
+            widget_start()
+        else:
+            print(f"  note: {WIDGET_UNSUPPORTED_MSG}")
+
+    print()
+    print("done. Roster:")
+    for a in sorted(cfg["agents"], key=lambda a: a["priority"]):
+        state = "" if a.get("enabled", True) else " (disabled)"
+        print(f"  {a['display']:8s} {a['backend']:6s} p{a['priority']} {a['access']:15s} {a['specialty']}{state}")
+    print()
+    print("Restart your boss CLI (claude / codex) to pick up the new MCP server.")
+    print("Customize: ticky add | ticky edit <name> key=value | ticky prefs | ticky log")
+
+
+# ----------------------------------------------------- roster management
+
+def cmd_add(args):
+    cfg = load_config() or {"version": 1, "preferences": DEFAULT_PREFS, "agents": []}
+    if args.name:
+        name = args.name.lower()
+        if get_agent(cfg, name):
+            die(f"agent {name!r} already exists (use `ticky edit`)")
+        agent = {
+            "name": name,
+            "display": args.name.capitalize(),
+            "backend": args.backend or "codex",
+            "model": args.model,
+            "specialty": args.specialty or "General-purpose subagent.",
+            "routing_note": args.note or "",
+            "priority": args.priority,
+            "access": args.access or "read-only",
+            "workdir": args.workdir or "~",
+            "network": False,
+            "timeout": args.timeout,
+            "enabled": True,
+            "extra_args": [],
+        }
+    else:
+        print("new agent (interactive; ctrl-c to abort)")
+        name = prompt_str("name (short, lowercase)").lower()
+        if not name:
+            die("name required")
+        if get_agent(cfg, name):
+            die(f"agent {name!r} already exists")
+        agent = {
+            "name": name,
+            "display": prompt_str("display name", name.capitalize()),
+            "backend": prompt_choice("backend", list(BACKENDS), "codex"),
+            "model": prompt_str("model (blank = backend default)") or None,
+            "specialty": prompt_str("specialty (what tasks is this agent for?)"),
+            "routing_note": prompt_str("routing note for the boss (optional)"),
+            "priority": int(prompt_str("priority (1 = call first)", "2") or 2),
+            "access": prompt_choice("access", list(ACCESS_LEVELS), "read-only"),
+            "workdir": prompt_str("workdir (sandbox root)", "~"),
+            "network": prompt_choice("network access (codex workspace-write only)", ["yes", "no"], "no") == "yes",
+            "timeout": int(prompt_str("timeout seconds", "900") or 900),
+            "enabled": True,
+            "extra_args": [],
+        }
+    if agent["backend"] not in BACKENDS:
+        die(f"backend must be one of {BACKENDS}")
+    if agent["access"] not in ACCESS_LEVELS:
+        die(f"access must be one of {ACCESS_LEVELS}")
+    cfg["agents"].append(agent)
+    save_config(cfg)
+    print(f"added {agent['display']} ({agent['backend']}, {agent['access']}). "
+          "Restart the boss CLI to expose the new tool.")
+
+
+def cmd_remove(args):
+    cfg = require_config()
+    a = get_agent(cfg, args.name)
+    if not a:
+        die(f"no agent named {args.name!r}")
+    cfg["agents"].remove(a)
+    save_config(cfg)
+    print(f"removed {a['display']}")
+
+
+def cmd_edit(args):
+    cfg = require_config()
+    a = get_agent(cfg, args.name)
+    if not a:
+        die(f"no agent named {args.name!r}")
+    ints = {"priority", "timeout"}
+    bools = {"enabled", "network"}
+    for pair in args.set:
+        if "=" not in pair:
+            die(f"expected key=value, got {pair!r}")
+        k, v = pair.split("=", 1)
+        if k not in a:
+            die(f"unknown field {k!r}; fields: {', '.join(a.keys())}")
+        if k in ints:
+            a[k] = int(v)
+        elif k in bools:
+            a[k] = v.lower() in ("1", "true", "yes", "on")
+        elif k == "access" and v not in ACCESS_LEVELS:
+            die(f"access must be one of {ACCESS_LEVELS}")
+        elif k == "backend" and v not in BACKENDS:
+            die(f"backend must be one of {BACKENDS}")
+        else:
+            a[k] = v if v != "" else None
+    save_config(cfg)
+    print(f"updated {a['display']}: {', '.join(args.set)}")
+
+
+def cmd_prefs(args):
+    cfg = require_config()
+    if args.text:
+        cfg["preferences"] = " ".join(args.text)
+        save_config(cfg)
+        print("preferences updated")
+    else:
+        print(cfg.get("preferences", "(none)"))
+
+
+def cmd_key(args):
+    ensure_home()
+    if args.action == "set":
+        if not args.name:
+            die("usage: ticky key set NAME (e.g. OPENAI_API_KEY)")
+        val = getpass.getpass(f"value for {args.name} (input hidden): ").strip()
+        if not val:
+            die("empty value, nothing saved")
+        env = load_env_file()
+        env[args.name] = val
+        with open(ENV_PATH, "w") as f:
+            for k, v in env.items():
+                f.write(f"{k}={v}\n")
+        os.chmod(ENV_PATH, stat.S_IRUSR | stat.S_IWUSR)
+        print(f"saved {args.name} to {ENV_PATH} (0600); backend calls will see it")
+    elif args.action == "list":
+        env = load_env_file()
+        for k in env:
+            print(k)
+        if not env:
+            print("(no keys stored)")
+    elif args.action == "unset":
+        env = load_env_file()
+        if args.name in env:
+            env.pop(args.name)
+            with open(ENV_PATH, "w") as f:
+                for k, v in env.items():
+                    f.write(f"{k}={v}\n")
+            os.chmod(ENV_PATH, stat.S_IRUSR | stat.S_IWUSR)
+            print(f"removed {args.name}")
+        else:
+            print(f"{args.name} not stored")
+
+
+# ------------------------------------------------------------- inspection
+
+def cmd_status(_args):
+    cfg = load_config()
+    backends = detect_backends()
+    print(f"ticky {VERSION}  home={TICKY_HOME}")
+    for b in ("codex", "claude"):
+        info = backends[b]
+        mark = "ok" if info["auth"] else ("found" if info["installed"] else "missing")
+        print(f"  {b:7s} [{mark}] {info['detail']}")
+    pids = widget_pids()
+    print(f"  widget  [{'ok' if pids else 'off'}] {'pid ' + str(pids[0]) if pids else 'not running'}")
+    if cfg is None:
+        print("  config  [missing] run `ticky init`")
+        return
+    print(f"  prefs   {cfg.get('preferences', '(none)')[:100]}")
+    print("  agents:")
+    for a in sorted(cfg["agents"], key=lambda a: a["priority"]):
+        state = "on " if a.get("enabled", True) else "off"
+        model = f"/{a['model']}" if a.get("model") else ""
+        print(f"    [{state}] {a['display']:8s} p{a['priority']} {a['backend']}{model:12s} "
+              f"{a['access']:15s} wd={a.get('workdir', '~')}  {a['specialty']}")
+    entries = read_log_tail(200)
+    today = datetime.now().astimezone().date()
+    n_today = 0
+    for e in entries:
+        try:
+            if datetime.fromisoformat(e.get("ts", "")).astimezone().date() == today:
+                n_today += 1
+        except ValueError:
+            pass
+    print(f"  calls   {len(entries)} recent logged, ~{n_today} today (ticky log for detail)")
+
+
+def fmt_entry(e):
+    mark = {"ok": "+", "error": "!"}.get(e.get("status"), "?")
+    return (f"[{mark}] {e.get('ts', '')}  {e.get('agent', '?'):8s} <- {e.get('boss', '?')} "
+            f"({e.get('duration_s', '?')}s)  {e.get('reason', '')}")
+
+
+def cmd_log(args):
+    if args.follow:
+        try:
+            with open(LOG_PATH) as f:
+                f.seek(0, 2)
+                while True:
+                    line = f.readline()
+                    if line:
+                        try:
+                            print(fmt_entry(json.loads(line)))
+                        except json.JSONDecodeError:
+                            pass
+                    else:
+                        time.sleep(0.5)
+        except FileNotFoundError:
+            die("no log yet")
+        except KeyboardInterrupt:
+            return
+    else:
+        for e in read_log_tail(args.n):
+            print(fmt_entry(e))
+
+
+def cmd_call(args):
+    cfg = require_config()
+    a = get_agent(cfg, args.agent)
+    if not a:
+        die(f"no agent named {args.agent!r}; agents: {', '.join(x['name'] for x in cfg['agents'])}")
+    reason = args.reason or "manual ticky call"
+    owner = f"manual-{os.getpid()}"
+    write_state([{"agent": a["display"], "reason": reason, "started": now_iso()}], owner)
+    try:
+        ok, text, duration = run_agent(a, args.task, args.context)
+    except Exception as error:
+        ok, text, duration = False, f"backend failed unexpectedly: {error}", 0.0
+    finally:
+        write_state([], owner)
+    append_log({
+        "ts": now_iso(), "boss": "terminal", "agent": a["display"], "backend": a["backend"],
+        "reason": reason, "task_preview": args.task[:200],
+        "status": "ok" if ok else "error", "duration_s": round(duration, 1), "chars": len(text),
+    })
+    print(text)
+    sys.exit(0 if ok else 1)
+
+
+def cmd_doctor(_args):
+    """End-to-end smoke test of the MCP pipeline using a throwaway mock agent."""
+    cfg = require_config()
+    probe = {
+        "name": "_probe", "display": "_probe", "backend": "mock", "model": None,
+        "specialty": "doctor probe", "routing_note": "", "priority": 99,
+        "access": "read-only", "workdir": "~", "network": False, "timeout": 30,
+        "enabled": True, "extra_args": [],
+    }
+    test_cfg = {"version": 1, "preferences": cfg.get("preferences", ""), "agents": cfg["agents"] + [probe]}
+
+    msgs = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": PROTOCOL_FALLBACK, "clientInfo": {"name": "ticky-doctor"}, "capabilities": {}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+         "params": {"name": "ask__probe", "arguments": {"task": "ping", "reason": "doctor self-test"}}},
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+        json.dump(test_cfg, tf)
+        tmp_cfg = tf.name
+    env = dict(os.environ)
+    inp = "\n".join(json.dumps(m) for m in msgs) + "\n"
+    r = subprocess.run(
+        [sys.executable, self_path(), "serve", "--config-override", tmp_cfg],
+        input=inp, capture_output=True, text=True, timeout=60, env=env)
+    os.unlink(tmp_cfg)
+
+    ok_init = ok_tools = ok_call = False
+    n_tools = 0
+    for line in r.stdout.splitlines():
+        try:
+            m = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if m.get("id") == 1 and "result" in m:
+            ok_init = True
+        if m.get("id") == 2 and "result" in m:
+            n_tools = len(m["result"].get("tools", []))
+            ok_tools = n_tools > 0
+        if m.get("id") == 3 and "result" in m and not m["result"].get("isError"):
+            ok_call = True
+
+    print(f"  MCP handshake     {'ok' if ok_init else 'FAIL'}")
+    print(f"  tools/list        {'ok, ' + str(n_tools) + ' tools' if ok_tools else 'FAIL'}")
+    print(f"  tools/call (mock) {'ok' if ok_call else 'FAIL'}")
+    backends = detect_backends()
+    for b in ("codex", "claude"):
+        info = backends[b]
+        mark = "ok" if info["auth"] else ("found, no auth?" if info["installed"] else "MISSING")
+        print(f"  backend {b:7s}   {mark}")
+    sys.exit(0 if (ok_init and ok_tools and ok_call) else 1)
+
+
+# ---------------------------------------------------------------- argparse
+
+def main():
+    global CONFIG_PATH
+    ap = argparse.ArgumentParser(prog="ticky", description=__doc__.splitlines()[0])
+    ap.add_argument("--version", action="version", version=f"ticky {VERSION}")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("init", help="one-command setup: config, boss registration, widget")
+    p.add_argument("--yes", "-y", action="store_true", help="non-interactive, keep/create defaults")
+    p.add_argument("--no-install", action="store_true", help="skip registering with claude/codex")
+    p.add_argument("--no-widget", action="store_true", help="skip building/starting the widget")
+    p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("serve", help="run the MCP stdio server (bosses call this)")
+    p.add_argument("--config-override", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_serve)
+
+    p = sub.add_parser("status", help="show backends, auth, roster, widget")
+    p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("setup", help="open the native setup window")
+    p.set_defaults(fn=cmd_setup)
+
+    p = sub.add_parser("add", help="add a custom agent (interactive without flags)")
+    p.add_argument("--name")
+    p.add_argument("--backend", choices=BACKENDS)
+    p.add_argument("--model")
+    p.add_argument("--specialty")
+    p.add_argument("--note", help="routing note the boss sees")
+    p.add_argument("--priority", type=int, default=2)
+    p.add_argument("--access", choices=ACCESS_LEVELS)
+    p.add_argument("--workdir")
+    p.add_argument("--timeout", type=int, default=900)
+    p.set_defaults(fn=cmd_add)
+
+    p = sub.add_parser("remove", help="remove an agent")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_remove)
+
+    p = sub.add_parser("edit", help="edit agent fields: ticky edit finch access=full priority=1")
+    p.add_argument("name")
+    p.add_argument("set", nargs="+", metavar="key=value")
+    p.set_defaults(fn=cmd_edit)
+
+    p = sub.add_parser("prefs", help="show or set global routing preferences")
+    p.add_argument("text", nargs="*", help="new preferences text (blank = show)")
+    p.set_defaults(fn=cmd_prefs)
+
+    p = sub.add_parser("key", help="store API keys for backends (0600 env file)")
+    p.add_argument("action", choices=["set", "list", "unset"])
+    p.add_argument("name", nargs="?")
+    p.set_defaults(fn=cmd_key)
+
+    p = sub.add_parser("install", help="register the MCP server with boss CLIs")
+    p.add_argument("target", nargs="?", choices=["claude", "codex", "all"], default="all")
+    p.set_defaults(fn=cmd_install)
+
+    p = sub.add_parser("uninstall", help="remove the MCP server from boss CLIs")
+    p.add_argument("target", nargs="?", choices=["claude", "codex", "all"], default="all")
+    p.set_defaults(fn=cmd_uninstall)
+
+    p = sub.add_parser("log", help="show the call log")
+    p.add_argument("-n", type=int, default=20, help="entries to show")
+    p.add_argument("-f", "--follow", action="store_true")
+    p.set_defaults(fn=cmd_log)
+
+    p = sub.add_parser("call", help="invoke an agent from the terminal")
+    p.add_argument("agent")
+    p.add_argument("task")
+    p.add_argument("-r", "--reason", help="reason for the log")
+    p.add_argument("-c", "--context")
+    p.set_defaults(fn=cmd_call)
+
+    p = sub.add_parser("widget", help="status widget (macOS for now): start|stop|restart|build|login|status")
+    p.add_argument("action", nargs="?", choices=["start", "stop", "restart", "build", "login", "status"])
+    p.set_defaults(fn=cmd_widget)
+
+    p = sub.add_parser("doctor", help="smoke-test the full MCP pipeline")
+    p.set_defaults(fn=cmd_doctor)
+
+    args = ap.parse_args()
+    if getattr(args, "config_override", None):
+        CONFIG_PATH = args.config_override
+    if not args.cmd:
+        cmd_status(args)
+        return
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
