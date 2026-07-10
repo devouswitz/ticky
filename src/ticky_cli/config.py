@@ -27,7 +27,7 @@ FORBIDDEN_EXTRA_OPTIONS = {
 }
 NAME_POOL = (
     "Aster", "Briar", "Cinder", "Dove", "Echo", "Finch", "Grove", "Harbor",
-    "Iris", "Jade", "Kestrel", "Lark", "Luna", "Mica", "Nova", "Onyx",
+    "Iris", "Jade", "Kestrel", "Lark", "Mica", "Nova", "Onyx",
     "Piper", "Quill", "Rook", "Sable", "Terra", "Vale", "Wren", "Yarrow",
 )
 DEFAULT_PREFERENCES = (
