@@ -1,167 +1,287 @@
 # ticky
 
-Simple yet robust one-command setup of multiple cross-platform subagents for a boss LLM.
+**A small CLI that turns AI accounts into named, well-described subagent tools for any MCP-capable LLM harness.**
 
-One zero-dependency Python file (`ticky`) that is simultaneously a setup wizard, an MCP
-stdio server, and a call logger, plus a tiny compiled status widget that shows who
-called what and why. No webpage, no venv, no npm, no daemons beyond the widget.
+ticky lets Claude Code call Codex, Codex call Claude Code, or any compatible boss harness dispatch either provider. Link as many CLI or API-key accounts as you need, group agents into reusable profiles, choose a model, thinking level, access policy, and specialty for each agent, then expose the active roster as MCP tools.
 
-The Python core is platform-neutral; everything OS-specific lives in the widget
-frontend under `widget/<platform>/`. Today that means `widget/macos/` (Swift,
-menu bar); Windows and Linux tray ports are planned and slot in beside it.
+The core is a zero-runtime-dependency Python 3.11+ application. It works on macOS, Linux, and Windows. There is no web app, native widget, daemon, Node install, or provider SDK.
 
-The native setup window opens with a focused team composer: a connections sidebar,
-grouped agent rows, and standard controls. Ticky has its own palette — a warm brass
-brand color plus one jewel tone per agent (Rook indigo, Wren terracotta, Finch olive),
-with light and dark variants. Models, workdirs, timeouts, API keys, and routing
-preferences remain available under **Advanced settings**.
+## What the boss harness receives
 
-## One-command setup
+For an active profile containing agents named Luna and Rook, ticky exposes:
 
-```
-~/ticky/ticky init --yes
-```
+- `ask_luna`
+- `ask_rook`
+- `ticky_roster`
 
-That single command:
+Each `ask_<name>` description includes the agent's specialty, routing note, provider account, model, thinking level, priority, access level, and work directory. The boss can choose an agent naturally from those descriptions. Every call requires:
 
-1. detects installed backend CLIs (`codex`, `claude`) and how they are authed
-   (subscription login or API key)
-2. writes the default roster (Rook, Wren, Finch) to `~/.ticky/config.json`
-3. symlinks `ticky` into `~/.local/bin` so it is on PATH
-4. registers the MCP server with both boss CLIs (`claude mcp add --scope user`,
-   `codex mcp add`)
-5. builds the status widget (macOS only for now), starts it, and registers it
-   to start at login
+- a complete, self-contained `task`
+- a specific one-line `reason`
+- optional extra `context`
 
-Restart the boss CLI afterward so it picks up the new MCP server. Run `init`
-without `--yes` for the interactive version; it never clobbers an existing
-roster without asking.
+Calls run concurrently when the boss invokes multiple tools in parallel. The response is the subagent's final text.
 
-## How the boss sees it
+## Quick start
 
-Any MCP-capable boss (Claude Code, Codex, others via `ticky serve`) gets:
+From this checkout:
 
-- one tool per agent (`ask_rook`, `ask_wren`, `ask_finch`, ...) whose description
-  carries the agent's specialty, routing note, priority, access level, and workdir
-- a `ticky_roster` tool listing all agents plus recent usage
-- server `instructions` carrying your global routing preferences, e.g. "ChatGPT
-  credits are ample, prefer Rook and Wren when a task fits both"
-
-Every call requires a one-line `reason`. It is logged to `~/.ticky/calls.jsonl`
-and shown in the widget, so you can always see which boss called which agent and why.
-
-## Default roster
-
-| Agent | Backend | Priority | Access          | For                                        |
-|-------|---------|----------|-----------------|--------------------------------------------|
-| Rook  | codex   | 1        | read-only       | deep reasoning, audits, second opinions    |
-| Wren  | codex   | 1        | read-only       | research, long documents, writing          |
-| Finch | claude  | 2        | workspace-write | hands-on coding, multi-file edits          |
-
-Codex-backed agents come first by default because ChatGPT credits are ample.
-Everything above is editable.
-
-## Custom agents and access control
-
-```
-ticky add                        # interactive: name, backend, specialty, access, workdir...
-ticky add --name vesta --backend claude --specialty "UI polish" --access read-only \
-          --note "Call Vesta for anything visual." --priority 3
-ticky edit finch access=full priority=1 workdir=~/novella
-ticky remove vesta
-ticky prefs ChatGPT credits are ample; prefer Rook and Wren. Finch only for edits.
+```sh
+./ticky init --yes
 ```
 
-Access levels and what they map to per backend:
+`init` creates `~/.ticky/config.json`, links the checkout into `~/.local/bin/ticky`, and registers the MCP server with installed Codex and Claude CLIs. Restart each connected harness afterward so it refreshes the tool list.
 
-| access          | codex                                    | claude                                            |
-|-----------------|------------------------------------------|---------------------------------------------------|
-| read-only       | `--sandbox read-only`                    | read/search/web tools only, no Bash/Edit/Write    |
-| workspace-write | `--sandbox workspace-write` (OS sandbox) | Edit/Write allowed, Bash still blocked (no OS sandbox in claude, so shell would mean full access) |
-| full            | `--sandbox danger-full-access`           | `--dangerously-skip-permissions`                  |
+To initialize without changing harness registrations:
 
-Each agent also gets a `workdir` (its cwd and sandbox root), optional `model`,
-`timeout`, `network` (codex workspace-write only), and `extra_args`.
-
-## Auth
-
-Subscription CLIs work out of the box (`codex login`, `claude` + `/login`).
-For API keys instead:
-
-```
-ticky key set OPENAI_API_KEY      # prompted, hidden input
-ticky key set ANTHROPIC_API_KEY
+```sh
+./ticky init --yes --no-install
 ```
 
-Keys are stored in `~/.ticky/env` (chmod 0600) and injected only into backend
-subprocesses, never written into config or logs.
+Editable install for development is also supported:
 
-## Desktop starter
-
-`~/Desktop/Start Ticky.app` is a double-clickable starter: on a fresh machine it
-runs the full `ticky init --yes`, otherwise it just makes sure the widget is up
-(launchd-managed), and posts a notification either way. It is a plain script
-app bundle; recreate it anywhere by copying `Contents/` (Info.plist plus
-`MacOS/start-ticky`).
-
-## Watching it work
-
-- **Widget**: the team glyph in the macOS menu bar. Gains a brass count while
-  agents run (hover for who and why), and the menu shows the last 10 calls with
-  boss, agent, duration, and reason.
-- **`ticky log`** (or `ticky log -f` to follow — this is the live view on every
-  platform):
-  `[+] 2026-07-09T18:54:58+00:00  Rook <- claude-code (3.9s) audit regression table`
-- **`ticky status`**: backends, auth, roster, widget state, calls today.
-- **`ticky doctor`**: smoke-tests the whole MCP pipeline with a mock agent.
-- **`ticky call rook "task" -r "reason"`**: invoke any agent from the terminal.
-
-## Platform support
-
-- **Core (`ticky` CLI, MCP server, logging)**: any OS with Python 3.11+.
-  POSIX-only calls (process groups, `fcntl` locking) and macOS-only probes
-  (Keychain) are feature-gated, and shared strings never assume an OS.
-- **Widget**: macOS only for now (`widget/macos/TickyWidget.swift`, AppKit).
-  `ticky widget` says so plainly elsewhere instead of failing. Windows and
-  Linux tray ports are planned as `widget/windows/` and `widget/linux/`.
-
-## Files
-
-```
-~/.ticky/config.json    roster + preferences (plain JSON, edit freely)
-~/.ticky/env            API keys, 0600
-~/.ticky/calls.jsonl    call history (ts, boss, agent, reason, status, duration)
-~/.ticky/state.json     currently running calls (widget polls this)
-~/.ticky/bin/ticky-widget    compiled widget
+```sh
+python3 -m pip install -e .
 ```
 
-## Uninstall
+## Accounts
 
+Accounts are global credential bindings. Agents refer to them by ID, so one profile can contain agents from several providers and several logins on the same provider.
+
+### Isolated subscription login
+
+```sh
+ticky account add \
+  --id personal-codex \
+  --label "Personal Codex" \
+  --provider codex \
+  --auth isolated \
+  --login
+
+ticky account add \
+  --id work-claude \
+  --label "Work Claude" \
+  --provider claude \
+  --auth isolated \
+  --login
 ```
-ticky uninstall          # remove from claude + codex
-ticky widget stop
-rm -rf ~/.ticky ~/.local/bin/ticky ~/Library/LaunchAgents/fun.ticky.widget.plist
+
+An isolated Codex account gets its own `CODEX_HOME`. An isolated Claude account gets its own `CLAUDE_CONFIG_DIR`. The provider login command runs with that isolated environment.
+
+### Existing CLI login
+
+Use `inherit` to reuse the provider CLI's normal user login:
+
+```sh
+ticky account add --id codex-default --provider codex --auth inherit
 ```
 
-## Notes
+### API-key account
 
-- Codex gates MCP tool calls behind an approval prompt, and in `codex exec`
-  there is no user to answer it, so calls die as "user cancelled".
-  `ticky install codex` therefore also sets
-  `default_tools_approval_mode = "approve"` under `[mcp_servers.ticky]`
-  in `~/.codex/config.toml` ("auto" only clears tools annotated read-only).
-- The MCP server handles parallel `tools/call` requests (one thread per call),
-  so a boss can fan out to Rook and Wren at once.
-- Wire tracing for debugging: `touch ~/.ticky/debug`, then read
-  `~/.ticky/server-debug.log`.
-- Subagents get no context automatically; the boss must write self-contained
-  tasks. The tool schema tells it so.
-- `mock` backend exists for tests (`ticky doctor` uses it).
+```sh
+ticky account add --id openai-api --provider codex --auth api-key
+ticky account key set openai-api
+```
+
+The key prompt is hidden. Secrets are stored in a per-account file under `~/.ticky/accounts/<id>/env` with mode `0600`. Secret values never appear in `config.json`, MCP tool descriptions, activity state, or call logs.
+
+Useful account commands:
+
+```sh
+ticky account list
+ticky account status
+ticky account login personal-codex
+ticky account key list openai-api
+ticky account key unset openai-api OPENAI_API_KEY
+ticky account remove old-account
+```
+
+Account removal is refused while any profile still references the account. Credential files are left on disk to prevent accidental secret deletion.
+
+## Profiles
+
+A profile is a reusable roster plus routing preferences. Accounts remain global.
+
+```sh
+ticky profile create ui-team               # clone the active profile
+ticky profile create research --empty      # start with no agents
+ticky profile use ui-team
+ticky profile prefs --profile ui-team \
+  Prefer Luna for browser QA. Use Rook for audits.
+ticky profile list
+ticky profile show ui-team
+```
+
+Changing the active profile does not mutate another profile's roster. Restart connected harnesses after switching profiles or changing agent names so their cached MCP tool definitions refresh.
+
+A harness registration may be pinned to a profile:
+
+```sh
+ticky install codex --profile research
+ticky install claude --profile ui-team
+```
+
+## Agents
+
+If `--name` is omitted, ticky generates a friendly collision-safe name such as Luna, Kestrel, or Sable.
+
+```sh
+ticky agent add \
+  --account personal-codex \
+  --model gpt-5.6 \
+  --thinking xhigh \
+  --access read-only \
+  --specialty "Deep analysis, audits, and second opinions" \
+  --note "Call this agent first for verification-shaped tasks" \
+  --priority 1
+```
+
+Create a hands-on agent on another account:
+
+```sh
+ticky agent add \
+  --name finch \
+  --display Finch \
+  --account work-claude \
+  --model opus \
+  --thinking high \
+  --access workspace-write \
+  --specialty "Multi-file implementation and focused test work"
+```
+
+Manage the selected profile:
+
+```sh
+ticky agent list
+ticky agent edit finch priority=1 workdir=~/projects/app
+ticky agent edit finch enabled=false
+ticky agent remove finch
+```
+
+### Thinking levels
+
+Accepted values are:
+
+- `default`
+- `minimal`
+- `low`
+- `medium`
+- `high`
+- `xhigh`
+- `max`
+
+Codex receives `model_reasoning_effort`. `max` maps to Codex `xhigh`. Claude receives `--effort`. `minimal` maps to Claude `low`.
+
+### Access levels
+
+| Access | Codex | Claude Code |
+|---|---|---|
+| `read-only` | `--sandbox read-only` | Read, search, and web tools; no shell or writes |
+| `workspace-write` | `--sandbox workspace-write` | Edit and write tools; Bash remains blocked |
+| `full` | `--sandbox danger-full-access` | `--dangerously-skip-permissions` |
+
+`full` is intentionally explicit. ticky does not silently promote a safer level when a provider command fails.
+
+Codex network access is enabled only when the agent has `workspace-write` and `network=true`.
+
+## Harness integration
+
+Known harnesses:
+
+```sh
+ticky install codex
+ticky install claude
+ticky install all
+ticky uninstall codex
+ticky uninstall claude
+```
+
+For any other MCP-capable harness:
+
+```sh
+ticky mcp-json --profile ui-team
+```
+
+This prints a standard stdio server entry containing the absolute ticky executable path and `serve --profile <name>` arguments. Add that object to the harness's MCP configuration.
+
+Codex noninteractive subagents cannot answer interactive MCP approval prompts. The Codex installer therefore sets `default_tools_approval_mode = "approve"` only inside `[mcp_servers.ticky]` when that section can be updated safely.
+
+## Live calls
+
+Open a second terminal:
+
+```sh
+ticky watch
+```
+
+The screen refreshes once per second and shows every currently running call across ticky server processes, followed by recent completions. A one-shot, script-friendly view is available:
+
+```sh
+ticky watch --once
+ticky watch --once -n 20
+```
+
+Completed calls:
+
+```sh
+ticky log
+ticky log -f
+ticky log -n 50
+```
+
+Logs contain call ID, boss harness, profile, agent, account, provider, model, thinking level, access, reason, task preview, status, duration, and output length. They never contain provider output or secrets.
+
+## Direct calls and health checks
+
+```sh
+ticky call luna "Audit the release plan" \
+  --reason "Luna is the verification specialist"
+
+ticky status
+ticky doctor
+```
+
+`doctor` creates a temporary mock account and agent, performs the MCP handshake, lists tools, dispatches a mock tool call, verifies live-state cleanup, and checks the completion log. It does not consume model credits or modify the active roster.
+
+## Configuration and runtime files
+
+```text
+~/.ticky/config.json                  accounts, profiles, active profile
+~/.ticky/config.v1.json               one-time backup after schema v1 migration
+~/.ticky/accounts/<id>/home/          isolated provider CLI home
+~/.ticky/accounts/<id>/env            account secrets, mode 0600
+~/.ticky/calls.jsonl                  completed call metadata
+~/.ticky/state.json                   currently running calls
+```
+
+### Schema v1 migration
+
+The first command that reads an old ticky config automatically:
+
+1. copies the untouched file to `config.v1.json`
+2. creates inherited `codex-default` and `claude-default` accounts as needed
+3. moves every existing agent into a `default` profile
+4. preserves names, specialties, routing notes, priorities, access, work directories, timeouts, enabled state, models, and global routing preferences
+5. atomically writes schema v2
+
+The migration does not modify provider credentials or call history.
+
+## Source layout
+
+```text
+ticky                         source-checkout executable wrapper
+src/ticky_cli/config.py       schema, migration, accounts, profiles, agents
+src/ticky_cli/providers.py    Codex and Claude command adapters
+src/ticky_cli/runtime.py      cross-process activity state and call history
+src/ticky_cli/mcp.py          MCP JSON-RPC server and generated tools
+src/ticky_cli/harnesses.py    known-harness registration and generic export
+src/ticky_cli/cli.py          command surface
+tests/                        behavioral unittest coverage
+```
 
 ## Development checks
 
 ```sh
-python3 -m unittest discover -s tests -v
-python3 -m py_compile ticky
-swiftc -O widget/macos/TickyWidget.swift -o /tmp/ticky-widget-test
+python3 -m compileall -q src ticky
+python3 -m unittest tests.test_config tests.test_providers tests.test_mcp_runtime -v
 ```
