@@ -39,6 +39,7 @@ from .harnesses import mcp_json_text, uninstall as uninstall_harness
 from .mcp import McpServer, serve as serve_mcp, tool_name
 from .providers import auth_status_command, login_command, run_agent
 from .runtime import Activity, format_log_entry, read_log_tail, read_state, render_activity
+from .wizard import ask, ask_bool, prompt_agent, run_roster_wizard
 
 
 def fail(message: str) -> None:
@@ -91,26 +92,39 @@ def cmd_init(args: argparse.Namespace) -> int:
     store = _store()
     existing = store.load(required=False)
     requested = _unique_providers(args.provider)
+    interactive = not args.yes and sys.stdin.isatty()
     if existing is None:
         selected = requested
         if not selected:
             detected = [provider for provider in ("codex", "claude") if shutil.which(provider)]
             selected = detected or ["codex", "claude"]
-            if not args.yes and sys.stdin.isatty():
-                raw = input(f"Providers, comma-separated [{','.join(selected)}]: ").strip()
-                if raw:
-                    selected = [item.strip().lower() for item in raw.split(",") if item.strip()]
-                    unknown = [item for item in selected if item not in ("codex", "claude")]
-                    if unknown:
-                        fail(f"unknown providers: {', '.join(unknown)}")
-                    selected = _unique_providers(selected)
+            if interactive:
+                raw = ask("Providers, comma-separated", ",".join(selected))
+                selected = [item.strip().lower() for item in raw.split(",") if item.strip()]
+                unknown = [item for item in selected if item not in ("codex", "claude")]
+                if unknown:
+                    fail(f"unknown providers: {', '.join(unknown)}")
+                selected = _unique_providers(selected)
         config = new_config(selected)
+        wizard = interactive and ask_bool(
+            "Build your agent roster interactively now (names, models, access, specialties)?",
+            True,
+        )
+        if wizard:
+            config["profiles"]["default"]["agents"] = []
         store.save(config)
         print(f"created {store.paths.config}")
+        if wizard:
+            run_roster_wizard(store, config, "default")
         install_targets = selected
     else:
         config = existing
         print(f"using existing config: {store.paths.config}")
+        _, active = find_profile(config)
+        if interactive and not active["agents"] and ask_bool(
+            "The active profile has no agents. Build the roster now?", True,
+        ):
+            run_roster_wizard(store, config, config["active_profile"])
         install_targets = requested or _unique_providers([
             account["provider"] for account in config["accounts"].values()
             if account["provider"] in ("codex", "claude")
@@ -126,7 +140,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"{target}: {'ok' if ok else 'error'}: {message}")
             code = code or (0 if ok else 1)
     print(f"active profile: {config['active_profile']}")
-    print("Next: `ticky account status`, `ticky agent list`, or `ticky watch`.")
+    print("Next: `ticky account status`, `ticky roster`, `ticky agent list`, or `ticky watch`.")
     print("Restart connected harnesses after changing profiles or agent tools.")
     return code
 
@@ -395,10 +409,26 @@ def _selected_account(config: dict[str, Any], requested: str | None) -> str:
     raise AssertionError("unreachable")
 
 
+def _agent_add_customized(args: argparse.Namespace) -> bool:
+    supplied = (
+        args.display, args.account, args.model, args.specialty, args.note,
+        args.thinking, args.priority, args.access, args.workdir, args.timeout,
+    )
+    return any(value is not None for value in supplied) or args.network
+
+
 def cmd_agent_add(args: argparse.Namespace) -> int:
     store = _store()
     config = store.load()
     profile_name, selected = find_profile(config, args.profile)
+    if args.name is None and not _agent_add_customized(args) and sys.stdin.isatty():
+        existing = [agent["name"] for agent in selected["agents"]]
+        record = prompt_agent(config, existing)
+        selected["agents"].append(record)
+        store.save(config)
+        print(f"added {record['display']} as {tool_name(record)} in {profile_name} using {record['account']}")
+        print("Restart connected harnesses to expose the new agent tool.")
+        return 0
     account_id = _selected_account(config, args.account)
     existing = [agent["name"] for agent in selected["agents"]]
     identity = args.name or args.display
@@ -413,13 +443,13 @@ def cmd_agent_add(args: argparse.Namespace) -> int:
         fail(f"agent {record['name']!r} already exists in profile {profile_name!r}")
     record.update({
         "model": args.model,
-        "thinking": args.thinking,
+        "thinking": args.thinking or "default",
         "routing_note": args.note or "",
-        "priority": args.priority,
-        "access": args.access,
-        "workdir": args.workdir,
+        "priority": 2 if args.priority is None else args.priority,
+        "access": args.access or "read-only",
+        "workdir": args.workdir or "~",
         "network": args.network,
-        "timeout": args.timeout,
+        "timeout": 900 if args.timeout is None else args.timeout,
     })
     selected["agents"].append(record)
     store.save(config)
@@ -530,6 +560,15 @@ def cmd_agent_remove(args: argparse.Namespace) -> int:
     print(f"removed {noun} {names} from {profile_name}")
     print("Restart connected harnesses to remove the agent tools.")
     return 0
+
+
+def cmd_roster(args: argparse.Namespace) -> int:
+    store = _store()
+    config = store.load()
+    if not sys.stdin.isatty():
+        fail("`ticky roster` is interactive; use `ticky agent add/edit/remove` in scripts")
+    profile_name, _ = find_profile(config, args.profile)
+    return run_roster_wizard(store, config, profile_name)
 
 
 def cmd_call(args: argparse.Namespace) -> int:
@@ -769,19 +808,19 @@ def build_parser() -> argparse.ArgumentParser:
     sub = agent_commands.add_parser("list")
     _add_profile_option(sub)
     sub.set_defaults(handler=cmd_agent_list)
-    sub = agent_commands.add_parser("add")
+    sub = agent_commands.add_parser("add", help="add an agent; with no arguments in a terminal, prompts interactively")
     sub.add_argument("name", nargs="?")
     sub.add_argument("--display")
     sub.add_argument("--account")
     sub.add_argument("--model")
-    sub.add_argument("--thinking", choices=THINKING_LEVELS, default="default")
+    sub.add_argument("--thinking", choices=THINKING_LEVELS)
     sub.add_argument("--specialty")
     sub.add_argument("--note")
-    sub.add_argument("--priority", type=int, default=2)
-    sub.add_argument("--access", choices=ACCESS_LEVELS, default="read-only")
-    sub.add_argument("--workdir", default="~")
+    sub.add_argument("--priority", type=int)
+    sub.add_argument("--access", choices=ACCESS_LEVELS)
+    sub.add_argument("--workdir")
     sub.add_argument("--network", action="store_true")
-    sub.add_argument("--timeout", type=int, default=900)
+    sub.add_argument("--timeout", type=int)
     _add_profile_option(sub)
     sub.set_defaults(handler=cmd_agent_add)
     sub = agent_commands.add_parser("edit")
@@ -793,6 +832,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_argument("name", nargs="+")
     _add_profile_option(sub)
     sub.set_defaults(handler=cmd_agent_remove)
+
+    roster = commands.add_parser("roster", help="interactively build or edit a profile's agent roster")
+    _add_profile_option(roster)
+    roster.set_defaults(handler=cmd_roster)
 
     call = commands.add_parser("call", help="invoke one agent from the terminal")
     call.add_argument("agent")
