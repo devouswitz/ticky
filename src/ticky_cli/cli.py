@@ -57,53 +57,78 @@ def _targets(value: str) -> list[str]:
     return [value] if value != "all" else ["claude", "codex"]
 
 
+def _unique_providers(providers: list[str] | None) -> list[str]:
+    return list(dict.fromkeys(providers or []))
+
+
 def _symlink_to_path() -> Path | None:
     source = Path(__file__).resolve().parents[2] / "ticky"
     if not source.is_file():
         return None
     destination = Path(os.path.expanduser("~/.local/bin/ticky"))
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() or destination.is_symlink():
-        if destination.resolve() == source.resolve():
-            return destination
-        destination.unlink()
     try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists() or destination.is_symlink():
+            existing = destination.resolve()
+            expected = source.resolve()
+            if existing == expected:
+                return destination
+            fail(
+                f"link conflict at {destination}: existing path points to {existing}; "
+                f"expected {expected}"
+            )
         destination.symlink_to(source)
-    except OSError:
-        return None
+    except ConfigError:
+        raise
+    except (OSError, RuntimeError) as error:
+        raise ConfigError(
+            f"could not link {destination} to {source}: {error}"
+        ) from error
     return destination
 
 
 def cmd_init(args: argparse.Namespace) -> int:
     store = _store()
     existing = store.load(required=False)
+    requested = _unique_providers(args.provider)
     if existing is None:
-        detected = [provider for provider in ("codex", "claude") if shutil.which(provider)]
-        selected = detected or ["codex", "claude"]
-        if not args.yes and sys.stdin.isatty():
-            raw = input(f"Providers, comma-separated [{','.join(selected)}]: ").strip()
-            if raw:
-                selected = [item.strip().lower() for item in raw.split(",") if item.strip()]
-                unknown = [item for item in selected if item not in ("codex", "claude")]
-                if unknown:
-                    fail(f"unknown providers: {', '.join(unknown)}")
+        selected = requested
+        if not selected:
+            detected = [provider for provider in ("codex", "claude") if shutil.which(provider)]
+            selected = detected or ["codex", "claude"]
+            if not args.yes and sys.stdin.isatty():
+                raw = input(f"Providers, comma-separated [{','.join(selected)}]: ").strip()
+                if raw:
+                    selected = [item.strip().lower() for item in raw.split(",") if item.strip()]
+                    unknown = [item for item in selected if item not in ("codex", "claude")]
+                    if unknown:
+                        fail(f"unknown providers: {', '.join(unknown)}")
+                    selected = _unique_providers(selected)
         config = new_config(selected)
         store.save(config)
         print(f"created {store.paths.config}")
+        install_targets = selected
     else:
         config = existing
-        print(f"using {store.paths.config}")
-    link = _symlink_to_path()
-    if link:
-        print(f"linked {link}")
+        print(f"using existing config: {store.paths.config}")
+        install_targets = requested or _unique_providers([
+            account["provider"] for account in config["accounts"].values()
+            if account["provider"] in ("codex", "claude")
+        ])
+    if not args.no_link:
+        link = _symlink_to_path()
+        if link:
+            print(f"linked {link}")
+    code = 0
     if not args.no_install:
-        for target in ("claude", "codex"):
+        for target in install_targets:
             ok, message = install_harness(target, config["active_profile"])
-            print(f"{target}: {'ok' if ok else 'skip'}: {message}")
+            print(f"{target}: {'ok' if ok else 'error'}: {message}")
+            code = code or (0 if ok else 1)
     print(f"active profile: {config['active_profile']}")
-    print("Next: `ticky account add`, `ticky agent add`, or `ticky watch`.")
+    print("Next: `ticky account status`, `ticky agent list`, or `ticky watch`.")
     print("Restart connected harnesses after changing profiles or agent tools.")
-    return 0
+    return code
 
 
 def cmd_account_list(args: argparse.Namespace) -> int:
@@ -342,10 +367,31 @@ def _selected_account(config: dict[str, Any], requested: str | None) -> str:
         if account_id not in config["accounts"]:
             fail(f"no account named {account_id!r}")
         return account_id
-    enabled = [key for key, value in config["accounts"].items() if value.get("enabled", True)]
+    enabled = sorted(
+        key for key, value in config["accounts"].items() if value.get("enabled", True)
+    )
     if len(enabled) == 1:
         return enabled[0]
-    fail("--account is required when more than one account exists")
+    if not enabled:
+        fail("no enabled accounts; run ticky account add")
+    if not sys.stdin.isatty():
+        fail(f"--account is required; available accounts: {', '.join(enabled)}")
+    print("Enabled accounts:")
+    for number, account_id in enumerate(enabled, start=1):
+        account = config["accounts"][account_id]
+        print(f"  {number}. {account_id} ({account['provider']}; {account.get('label') or account_id})")
+    while True:
+        try:
+            raw = input(f"Select account [1-{len(enabled)}]: ").strip()
+        except EOFError as error:
+            raise ConfigError("account selection ended before a valid number was entered") from error
+        try:
+            number = int(raw)
+        except ValueError:
+            number = 0
+        if 1 <= number <= len(enabled):
+            return enabled[number - 1]
+        print(f"Enter a number from 1 to {len(enabled)}.")
     raise AssertionError("unreachable")
 
 
@@ -355,10 +401,11 @@ def cmd_agent_add(args: argparse.Namespace) -> int:
     profile_name, selected = find_profile(config, args.profile)
     account_id = _selected_account(config, args.account)
     existing = [agent["name"] for agent in selected["agents"]]
+    identity = args.name or args.display
     record = agent_record(
         account_id,
         existing,
-        name=args.name,
+        name=identity,
         display=args.display,
         specialty=args.specialty or "General-purpose subagent.",
     )
@@ -380,6 +427,7 @@ def cmd_agent_add(args: argparse.Namespace) -> int:
         f"added {record['display']} as {tool_name(record)} in {profile_name} "
         f"using {account_id}"
     )
+    print("Restart connected harnesses to expose the new agent tool.")
     return 0
 
 
@@ -424,11 +472,17 @@ def cmd_agent_edit(args: argparse.Namespace) -> int:
         if key not in allowed:
             fail(f"unknown field {key!r}; fields: {', '.join(sorted(allowed))}")
         if key in integer_fields:
-            record[key] = int(value)
+            try:
+                record[key] = int(value)
+            except ValueError as error:
+                raise ConfigError(f"{key} must be an integer, got {value!r}") from error
         elif key in boolean_fields:
             record[key] = _parse_bool(value)
         elif key == "extra_args":
-            parsed = json.loads(value)
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as error:
+                raise ConfigError("extra_args must be valid JSON") from error
             if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
                 fail("extra_args must be a JSON array of strings")
             record[key] = parsed
@@ -461,10 +515,20 @@ def cmd_agent_remove(args: argparse.Namespace) -> int:
     store = _store()
     config = store.load()
     profile_name, selected = find_profile(config, args.profile)
-    record = find_agent(config, args.name, profile_name)
-    selected["agents"].remove(record)
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for name in args.name:
+        record = find_agent(config, name, profile_name)
+        if record["name"] not in seen:
+            records.append(record)
+            seen.add(record["name"])
+    for record in records:
+        selected["agents"].remove(record)
     store.save(config)
-    print(f"removed {record['display']} from {profile_name}")
+    names = ", ".join(record["name"] for record in records)
+    noun = "agent" if len(records) == 1 else "agents"
+    print(f"removed {noun} {names} from {profile_name}")
+    print("Restart connected harnesses to remove the agent tools.")
     return 0
 
 
@@ -639,7 +703,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = commands.add_parser("init", aliases=["setup"], help="initialize config and harness registrations")
     init.add_argument("--yes", "-y", action="store_true", help="accept detected providers without prompts")
+    init.add_argument(
+        "--provider", action="append", choices=("codex", "claude"),
+        help="provider to configure or register (repeatable)",
+    )
     init.add_argument("--no-install", action="store_true", help="do not register MCP with known harnesses")
+    init.add_argument("--no-link", action="store_true", help="do not link ticky into ~/.local/bin")
     init.set_defaults(handler=cmd_init)
 
     account = commands.add_parser("account", help="manage provider credential accounts")
@@ -701,7 +770,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_profile_option(sub)
     sub.set_defaults(handler=cmd_agent_list)
     sub = agent_commands.add_parser("add")
-    sub.add_argument("--name")
+    sub.add_argument("name", nargs="?")
     sub.add_argument("--display")
     sub.add_argument("--account")
     sub.add_argument("--model")
@@ -721,7 +790,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_profile_option(sub)
     sub.set_defaults(handler=cmd_agent_edit)
     sub = agent_commands.add_parser("remove")
-    sub.add_argument("name")
+    sub.add_argument("name", nargs="+")
     _add_profile_option(sub)
     sub.set_defaults(handler=cmd_agent_remove)
 
