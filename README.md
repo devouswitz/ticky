@@ -1,52 +1,71 @@
 # ticky
 
-**A small CLI that turns AI accounts into named, well-described subagent tools for any MCP-capable LLM harness.**
+**Turn your AI CLI accounts into named subagents that any MCP-capable harness can call.**
 
-ticky lets Claude Code call Codex, Codex call Claude Code, or any compatible boss harness dispatch either provider. Link as many CLI or API-key accounts as you need, group agents into reusable profiles, choose a model, thinking level, access policy, and specialty for each agent, then expose the active roster as MCP tools.
+With ticky, Claude Code can dispatch work to Codex, Codex can dispatch work to Claude Code, and either can fan out to a whole roster of named agents (each with its own account, model, thinking effort, and access policy). You describe each agent once ("use Rook for deep audits"); the boss LLM reads those descriptions and routes work by itself.
 
-The core is a zero-runtime-dependency Python 3.11+ application. It works on macOS, Linux, and Windows. There is no web app, native widget, daemon, Node install, or provider SDK.
+- Zero runtime dependencies: one Python 3.11+ package, no Node, no daemon, no SDKs.
+- Works on macOS, Linux, and Windows.
+- Your credentials stay in per-account files on your machine; secrets never enter configs, logs, or tool descriptions.
 
-## What the boss harness receives
+## Get started in one click (macOS)
 
-For an active profile containing agents named Luna and Rook, ticky exposes:
+1. Clone or download this repository.
+2. Double-click **`Start Ticky.command`**.
 
-- `ask_luna`
-- `ask_rook`
-- `ticky_roster`
+That's it. A Terminal window opens and walks you through everything:
 
-Each `ask_<name>` description includes the agent's specialty, routing note, provider account, model, thinking level, priority, access level, and work directory. The boss can choose an agent naturally from those descriptions. Every call requires:
+1. ticky detects which provider CLIs you have installed (`codex`, `claude`).
+2. A guided wizard offers to build your agent roster. For each agent you pick a name, the account it runs on, an optional model, thinking effort, an access level, and the two comments the boss LLM reads when routing work: a one-line specialty ("use for deep audits") and an optional routing note ("call this agent first for verification"). Every prompt shows its default in brackets; pressing Return accepts it.
+3. ticky registers itself with your installed Codex and Claude Code harnesses and shows a status summary.
 
-- a complete, self-contained `task`
-- a specific one-line `reason`
-- optional extra `context`
+Then restart your Codex or Claude Code session so it picks up the new agent tools. Done.
 
-Calls run concurrently when the boss invokes multiple tools in parallel. The response is the subagent's final text.
+## Get started from a terminal
 
-## Quick start
+```sh
+git clone https://github.com/devouswitz/ticky.git
+cd ticky
+./ticky init
+```
 
-On macOS, double-click `Start Ticky.command` for one-click setup. It initializes ticky, registers the configured Codex and Claude harnesses, shows status, and keeps the Terminal window open if setup needs attention.
+`init` runs the same detection, wizard, and harness registration as the one-click launcher. Decline the wizard and ticky seeds one general-purpose agent per provider instead; you can shape the roster later with `ticky roster`.
 
-From a terminal:
+For unattended or scripted setup:
 
 ```sh
 ./ticky init --yes --provider codex --provider claude
 ```
 
-`--provider` is repeatable, and duplicate values are ignored without changing their order. For a new config, `init` creates accounts and agents only for the selected providers and registers only those harnesses. If `--provider` is omitted, ticky retains its provider detection and interactive selection behavior. `init` also links the checkout into `~/.local/bin/ticky`. Restart each connected harness afterward so it refreshes the tool list.
+`--no-install` skips harness registration and `--no-link` skips linking the checkout into `~/.local/bin`. Re-running `init` reuses an existing config without changing it (and offers the wizard again if your roster is empty). An editable install is also supported: `python3 -m pip install -e .`
 
-To initialize without changing harness registrations or creating the local link:
+## Everyday commands
 
-```sh
-./ticky init --yes --no-install --no-link
-```
+| Command | What it does |
+|---|---|
+| `ticky roster` | Interactive wizard: add, edit, or remove agents and set routing preferences |
+| `ticky status` | Config, accounts, and activity at a glance |
+| `ticky watch` | Live view of running and recent agent calls |
+| `ticky agent list` | Print the active roster |
+| `ticky call <agent> "<task>"` | Invoke one agent directly from your terminal |
+| `ticky log` | Completed call history |
+| `ticky doctor` | Self-test the MCP pipeline without spending credits |
 
-`--no-install` controls harness registration, while `--no-link` controls the local link. Re-running `init` reuses an existing v2 config without changing its accounts or agents; older configs migrate to the current schema when loaded. Without explicit `--provider` values, ticky derives registration targets from the configured accounts.
+## What the boss harness receives
 
-Editable install for development is also supported:
+For an active profile containing agents named Wren and Rook, ticky exposes:
 
-```sh
-python3 -m pip install -e .
-```
+- `ask_wren`
+- `ask_rook`
+- `ticky_roster`
+
+Each `ask_<name>` description includes the agent's specialty, routing note, provider account, model, thinking level, priority, access level, and work directory. The boss chooses an agent naturally from those descriptions. Every call requires:
+
+- a complete, self-contained `task`
+- a specific one-line `reason` (logged and shown in `ticky watch`)
+- optional extra `context`
+
+Calls run concurrently when the boss invokes multiple tools in parallel. The response is the subagent's final text.
 
 ## Accounts
 
@@ -111,7 +130,7 @@ ticky profile create ui-team               # clone the active profile
 ticky profile create research --empty      # start with no agents
 ticky profile use ui-team
 ticky profile prefs --profile ui-team \
-  Prefer Luna for browser QA. Use Rook for audits.
+  Prefer Wren for browser QA. Use Rook for audits.
 ticky profile list
 ticky profile show ui-team
 ```
@@ -127,7 +146,22 @@ ticky install claude --profile ui-team
 
 ## Agents
 
-The agent name is an optional positional argument. If both `NAME` and `--display` are omitted, ticky generates a friendly collision-safe name such as Luna, Kestrel, or Sable. With only `--display`, its value supplies both the display name and slug identity.
+### Interactive roster editing
+
+The fastest way to shape a roster is the wizard:
+
+```sh
+ticky roster                    # edit the active profile
+ticky roster --profile research # edit another profile
+```
+
+It shows the current roster, then loops through add, edit, remove, and preferences actions. Editing an agent re-prompts every field with the current value as the default, so pressing Return keeps what is already there; entering `-` clears an optional value. Preferences is the profile-level routing text the boss LLM receives at the start of every session (for example "prefer the codex-backed agents"). Each change is saved immediately.
+
+Running `ticky agent add` with no arguments in a terminal starts the same per-agent prompts. Passing a name or any customization flag keeps the classic one-shot behavior below.
+
+### Scripted agent management
+
+The agent name is an optional positional argument. If both `NAME` and `--display` are omitted, ticky generates a friendly collision-safe name such as Wren, Kestrel, or Sable. With only `--display`, its value supplies both the display name and slug identity.
 
 ```sh
 ticky agent add \
@@ -241,8 +275,8 @@ Logs contain call ID, boss harness, profile, agent, account, provider, model, th
 ## Direct calls and health checks
 
 ```sh
-ticky call luna "Audit the release plan" \
-  --reason "Luna is the verification specialist"
+ticky call rook "Audit the release plan" \
+  --reason "Rook is the verification specialist"
 
 ticky status
 ticky doctor
@@ -282,6 +316,7 @@ src/ticky_cli/providers.py    Codex and Claude command adapters
 src/ticky_cli/runtime.py      cross-process activity state and call history
 src/ticky_cli/mcp.py          MCP JSON-RPC server and generated tools
 src/ticky_cli/harnesses.py    known-harness registration and generic export
+src/ticky_cli/wizard.py       interactive roster setup and editing prompts
 src/ticky_cli/cli.py          command surface
 tests/                        behavioral unittest coverage
 ```
@@ -290,5 +325,5 @@ tests/                        behavioral unittest coverage
 
 ```sh
 python3 -m compileall -q src ticky
-python3 -m unittest tests.test_config tests.test_providers tests.test_mcp_runtime -v
+python3 -m unittest discover -s tests
 ```

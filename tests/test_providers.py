@@ -17,7 +17,7 @@ class ProviderBehaviorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             paths = AppPaths(Path(temporary))
             account = account_record("codex-work", "codex", auth="isolated")
-            agent = agent_record("codex-work", name="luna", display="Luna")
+            agent = agent_record("codex-work", name="vale", display="Vale")
             agent.update({
                 "model": "gpt-5.6",
                 "thinking": "xhigh",

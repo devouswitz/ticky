@@ -23,14 +23,14 @@ class McpAndActivityBehaviorTests(unittest.TestCase):
         config["accounts"]["mock-default"] = account_record("mock-default", "mock", "Mock")
         agent = agent_record(
             "mock-default",
-            name="luna",
-            display="Luna",
+            name="vale",
+            display="Vale",
             specialty="UI testing and browser QA.",
         )
         agent.update({
             "model": "gpt-test",
             "thinking": "high",
-            "routing_note": "Call Luna for visible product behavior.",
+            "routing_note": "Call Vale for visible product behavior.",
             "priority": 1,
         })
         config["profiles"]["default"]["agents"] = [agent]
@@ -56,10 +56,10 @@ class McpAndActivityBehaviorTests(unittest.TestCase):
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "ask_luna",
+                    "name": "ask_vale",
                     "arguments": {
                         "task": "Check the setup screen",
-                        "reason": "Luna specializes in UI testing",
+                        "reason": "Vale specializes in UI testing",
                     },
                 },
             })
@@ -68,13 +68,13 @@ class McpAndActivityBehaviorTests(unittest.TestCase):
             responses = {value["id"]: value for value in map(json.loads, sink.getvalue().splitlines())}
 
             tools = responses[2]["result"]["tools"]
-            luna = next(tool for tool in tools if tool["name"] == "ask_luna")
-            self.assertIn("UI testing", luna["description"])
-            self.assertIn("mock-default", luna["description"])
-            self.assertIn("thinking: high", luna["description"])
-            self.assertEqual(luna["inputSchema"]["required"], ["task", "reason"])
+            vale = next(tool for tool in tools if tool["name"] == "ask_vale")
+            self.assertIn("UI testing", vale["description"])
+            self.assertIn("mock-default", vale["description"])
+            self.assertIn("thinking: high", vale["description"])
+            self.assertEqual(vale["inputSchema"]["required"], ["task", "reason"])
             self.assertFalse(responses[3]["result"]["isError"])
-            self.assertIn("[mock:luna]", responses[3]["result"]["content"][0]["text"])
+            self.assertIn("[mock:vale]", responses[3]["result"]["content"][0]["text"])
 
             entries = read_log_tail(paths, 5)
             self.assertEqual(len(entries), 1)
@@ -87,13 +87,13 @@ class McpAndActivityBehaviorTests(unittest.TestCase):
     def test_state_merges_independent_sessions(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = AppPaths(Path(temporary))
-            luna = {"agent": "Luna", "provider": "codex", "account": "work", "reason": "UI"}
+            vale = {"agent": "Vale", "provider": "codex", "account": "work", "reason": "UI"}
             rook = {"agent": "Rook", "provider": "claude", "account": "audit", "reason": "Review"}
-            write_state(paths, [luna], "session-a")
+            write_state(paths, [vale], "session-a")
             write_state(paths, [rook], "session-b")
             self.assertEqual(
                 {call["agent"] for call in read_state(paths)["running"]},
-                {"Luna", "Rook"},
+                {"Vale", "Rook"},
             )
             write_state(paths, [], "session-a")
             self.assertEqual(read_state(paths)["running"], [rook])
@@ -101,7 +101,7 @@ class McpAndActivityBehaviorTests(unittest.TestCase):
     def test_read_state_prunes_dead_process_owner(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = AppPaths(Path(temporary))
-            stale = {"agent": "Luna", "provider": "codex", "account": "work", "reason": "old"}
+            stale = {"agent": "Vale", "provider": "codex", "account": "work", "reason": "old"}
             write_state(paths, [stale], "dead-session", pid=999_999_999)
             self.assertEqual(read_state(paths)["running"], [])
 
@@ -109,7 +109,7 @@ class McpAndActivityBehaviorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             paths = AppPaths(Path(temporary))
             write_state(paths, [{
-                "agent": "Luna",
+                "agent": "Vale",
                 "provider": "codex",
                 "account": "work",
                 "boss": "claude-code",
@@ -125,7 +125,7 @@ class McpAndActivityBehaviorTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("1 running", result.stdout)
-            self.assertIn("Luna", result.stdout)
+            self.assertIn("Vale", result.stdout)
             self.assertIn("UI testing", result.stdout)
 
     def test_doctor_exercises_mcp_and_activity_pipeline(self):
@@ -159,7 +159,7 @@ class McpAndActivityBehaviorTests(unittest.TestCase):
                 time.sleep(0.7)
                 append_log(paths, {
                     "ts": "2026-07-10T00:00:00+00:00",
-                    "agent": "Luna",
+                    "agent": "Vale",
                     "provider": "codex",
                     "account": "work",
                     "boss": "claude-code",
@@ -175,7 +175,7 @@ class McpAndActivityBehaviorTests(unittest.TestCase):
                     process.kill()
                     process.wait(timeout=10)
             self.assertEqual(stderr, "")
-            self.assertIn("Luna", stdout)
+            self.assertIn("Vale", stdout)
             self.assertIn("UI testing", stdout)
 
     def test_render_activity_empty_state_is_explicit(self):

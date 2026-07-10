@@ -137,9 +137,9 @@ class ConfigBehaviorTests(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
 
     def test_agent_record_uses_requested_account_and_generated_identity(self):
-        record = agent_record("codex-work", existing=("luna", "rook"))
+        record = agent_record("codex-work", existing=("vale", "rook"))
         self.assertEqual(record["account"], "codex-work")
-        self.assertNotIn(record["name"], {"luna", "rook"})
+        self.assertNotIn(record["name"], {"vale", "rook"})
         self.assertEqual(record["thinking"], "default")
         self.assertEqual(record["access"], "read-only")
 
