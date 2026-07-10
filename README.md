@@ -24,19 +24,23 @@ Calls run concurrently when the boss invokes multiple tools in parallel. The res
 
 ## Quick start
 
-From this checkout:
+On macOS, double-click `Start Ticky.command` for one-click setup. It initializes ticky, registers the configured Codex and Claude harnesses, shows status, and keeps the Terminal window open if setup needs attention.
+
+From a terminal:
 
 ```sh
-./ticky init --yes
+./ticky init --yes --provider codex --provider claude
 ```
 
-`init` creates `~/.ticky/config.json`, links the checkout into `~/.local/bin/ticky`, and registers the MCP server with installed Codex and Claude CLIs. Restart each connected harness afterward so it refreshes the tool list.
+`--provider` is repeatable, and duplicate values are ignored without changing their order. For a new config, `init` creates accounts and agents only for the selected providers and registers only those harnesses. If `--provider` is omitted, ticky retains its provider detection and interactive selection behavior. `init` also links the checkout into `~/.local/bin/ticky`. Restart each connected harness afterward so it refreshes the tool list.
 
-To initialize without changing harness registrations:
+To initialize without changing harness registrations or creating the local link:
 
 ```sh
-./ticky init --yes --no-install
+./ticky init --yes --no-install --no-link
 ```
+
+`--no-install` controls harness registration, while `--no-link` controls the local link. Re-running `init` reuses an existing v2 config without changing its accounts or agents; older configs migrate to the current schema when loaded. Without explicit `--provider` values, ticky derives registration targets from the configured accounts.
 
 Editable install for development is also supported:
 
@@ -123,7 +127,7 @@ ticky install claude --profile ui-team
 
 ## Agents
 
-If `--name` is omitted, ticky generates a friendly collision-safe name such as Luna, Kestrel, or Sable.
+The agent name is an optional positional argument. If both `NAME` and `--display` are omitted, ticky generates a friendly collision-safe name such as Luna, Kestrel, or Sable. With only `--display`, its value supplies both the display name and slug identity.
 
 ```sh
 ticky agent add \
@@ -136,11 +140,12 @@ ticky agent add \
   --priority 1
 ```
 
+When `--account` is omitted, ticky selects the only enabled account automatically. With several enabled accounts, it prompts with a numbered account list in an interactive terminal. Noninteractive calls must pass `--account`, and a config with no enabled accounts must first run `ticky account add`.
+
 Create a hands-on agent on another account:
 
 ```sh
-ticky agent add \
-  --name finch \
+ticky agent add finch \
   --display Finch \
   --account work-claude \
   --model opus \
@@ -155,8 +160,10 @@ Manage the selected profile:
 ticky agent list
 ticky agent edit finch priority=1 workdir=~/projects/app
 ticky agent edit finch enabled=false
-ticky agent remove finch
+ticky agent remove finch rook
 ```
+
+Agent additions and removals require connected harnesses to restart before the changed tool list is visible. Multi-agent removal resolves every requested name before saving, so an invalid name removes nothing.
 
 ### Thinking levels
 

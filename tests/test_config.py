@@ -1,19 +1,59 @@
 import json
+import io
 import os
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 import sys
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 TICKY = ROOT / "ticky"
 sys.path.insert(0, str(ROOT / "src"))
 
-from ticky_cli.config import AppPaths, ConfigStore, agent_record, generated_agent_name
+from ticky_cli.config import (
+    AppPaths,
+    ConfigError,
+    ConfigStore,
+    agent_record,
+    generated_agent_name,
+    new_config,
+)
+from ticky_cli.cli import _selected_account, _symlink_to_path, cmd_init
 
 
 class ConfigBehaviorTests(unittest.TestCase):
+    def _environment(self, temporary):
+        return dict(
+            os.environ,
+            TICKY_HOME=temporary,
+            HOME=temporary,
+            USERPROFILE=temporary,
+        )
+
+    def _run(self, temporary, *arguments):
+        return subprocess.run(
+            [str(TICKY), *arguments],
+            cwd=ROOT,
+            env=self._environment(temporary),
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+
+    def _load(self, temporary):
+        return json.loads(Path(temporary, "config.json").read_text())
+
+    def _initialize(self, temporary, *providers):
+        arguments = ["init", "--yes", "--no-install", "--no-link"]
+        for provider in providers or ("codex",):
+            arguments.extend(["--provider", provider])
+        result = self._run(temporary, *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
     def test_v1_migration_preserves_roster_and_creates_backup(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = AppPaths(Path(temporary))
@@ -59,22 +99,9 @@ class ConfigBehaviorTests(unittest.TestCase):
 
     def test_profile_clone_and_use_are_isolated(self):
         with tempfile.TemporaryDirectory() as temporary:
-            environment = dict(
-                os.environ,
-                TICKY_HOME=temporary,
-                HOME=temporary,
-                USERPROFILE=temporary,
-            )
-            initialized = subprocess.run(
-                [str(TICKY), "init", "--yes", "--no-install"],
-                cwd=ROOT,
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=30,
-            )
-            self.assertEqual(initialized.returncode, 0, initialized.stderr)
-            config = json.loads(Path(temporary, "config.json").read_text())
+            self._initialize(temporary)
+            environment = self._environment(temporary)
+            config = self._load(temporary)
             original_name = config["profiles"]["default"]["agents"][0]["name"]
 
             created = subprocess.run(
@@ -115,6 +142,215 @@ class ConfigBehaviorTests(unittest.TestCase):
         self.assertNotIn(record["name"], {"luna", "rook"})
         self.assertEqual(record["thinking"], "default")
         self.assertEqual(record["access"], "read-only")
+
+    def test_init_provider_selection_is_ordered_and_deduplicated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self._initialize(temporary, "claude", "codex", "claude")
+
+            config = self._load(temporary)
+            agents = config["profiles"]["default"]["agents"]
+            self.assertEqual(set(config["accounts"]), {"claude-default", "codex-default"})
+            self.assertEqual(
+                [agent["account"] for agent in agents],
+                ["claude-default", "codex-default"],
+            )
+
+    def test_init_registration_failure_is_an_error_and_returns_nonzero(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = mock.Mock(
+                provider=["codex"],
+                yes=True,
+                no_install=False,
+                no_link=True,
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, self._environment(temporary)),
+                mock.patch(
+                    "ticky_cli.cli.install_harness",
+                    return_value=(False, "registration failed"),
+                ),
+                redirect_stdout(output),
+            ):
+                code = cmd_init(args)
+
+            self.assertEqual(code, 1)
+            self.assertIn("codex: error: registration failed", output.getvalue())
+
+    def test_init_link_is_idempotent_and_preserves_conflict(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            arguments = (
+                "init", "--yes", "--provider", "codex", "--no-install",
+            )
+            first = self._run(temporary, *arguments)
+            second = self._run(temporary, *arguments)
+            link = Path(temporary, ".local", "bin", "ticky")
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(link.resolve(), TICKY.resolve())
+            self.assertIn("using existing config", second.stdout)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary, ".local", "bin", "ticky")
+            destination.parent.mkdir(parents=True)
+            other = Path(temporary, "other-ticky")
+            other.write_text("not this checkout\n", encoding="utf-8")
+            destination.symlink_to(other)
+
+            result = self._run(
+                temporary, "init", "--yes", "--provider", "codex", "--no-install"
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("link conflict", result.stderr)
+            self.assertIn(str(other), result.stderr)
+            self.assertTrue(destination.is_symlink())
+            self.assertEqual(destination.resolve(), other.resolve())
+
+    def test_init_link_errors_are_clean(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = self._environment(temporary)
+            with (
+                mock.patch.dict(os.environ, environment),
+                mock.patch.object(
+                    Path,
+                    "symlink_to",
+                    side_effect=PermissionError("permission denied"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ConfigError,
+                    "could not link.*permission denied",
+                ):
+                    _symlink_to_path()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary, ".local", "bin", "ticky")
+            destination.parent.mkdir(parents=True)
+            destination.symlink_to(destination)
+
+            result = self._run(
+                temporary, "init", "--yes", "--provider", "codex", "--no-install"
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertRegex(result.stderr, "link conflict|could not link")
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertTrue(destination.is_symlink())
+
+    def test_agent_add_reports_zero_and_multiple_account_choices(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ConfigStore(AppPaths(Path(temporary))).save(new_config([]))
+            result = self._run(temporary, "agent", "add", "helper")
+
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(
+                result.stderr.strip(),
+                "ticky: no enabled accounts; run ticky account add",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            ConfigStore(AppPaths(Path(temporary))).save(new_config(["codex", "claude"]))
+            result = self._run(temporary, "agent", "add", "helper")
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("available accounts:", result.stderr)
+            self.assertIn("claude-default", result.stderr)
+            self.assertIn("codex-default", result.stderr)
+
+            output = io.StringIO()
+            with (
+                mock.patch("ticky_cli.cli.sys.stdin.isatty", return_value=True),
+                mock.patch("builtins.input", side_effect=["invalid", "2"]),
+                redirect_stdout(output),
+            ):
+                selected = _selected_account(new_config(["codex", "claude"]), None)
+            self.assertEqual(selected, "codex-default")
+            self.assertIn(
+                "1. claude-default (claude; Default Claude)", output.getvalue()
+            )
+            self.assertIn(
+                "2. codex-default (codex; Default Codex)", output.getvalue()
+            )
+            self.assertIn("Enter a number from 1 to 2.", output.getvalue())
+
+    def test_agent_add_uses_positional_or_display_identity_and_infers_account(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self._initialize(temporary)
+
+            named = self._run(
+                temporary, "agent", "add", "finch", "--display", "Finch Helper"
+            )
+            displayed = self._run(
+                temporary, "agent", "add", "--display", "Display Only"
+            )
+
+            self.assertEqual(named.returncode, 0, named.stderr)
+            self.assertEqual(displayed.returncode, 0, displayed.stderr)
+            self.assertIn("Restart connected harnesses", named.stdout)
+            self.assertIn("Restart connected harnesses", displayed.stdout)
+            agents = {
+                agent["name"]: agent
+                for agent in self._load(temporary)["profiles"]["default"]["agents"]
+            }
+            self.assertEqual(agents["finch"]["display"], "Finch Helper")
+            self.assertEqual(agents["finch"]["account"], "codex-default")
+            self.assertEqual(agents["display-only"]["display"], "Display Only")
+
+    def test_agent_multi_remove_is_atomic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self._initialize(temporary)
+            for name in ("alpha", "beta"):
+                added = self._run(temporary, "agent", "add", name)
+                self.assertEqual(added.returncode, 0, added.stderr)
+
+            failed = self._run(
+                temporary, "agent", "remove", "alpha", "missing", "beta"
+            )
+            self.assertEqual(failed.returncode, 2)
+            names = {
+                agent["name"]
+                for agent in self._load(temporary)["profiles"]["default"]["agents"]
+            }
+            self.assertTrue({"alpha", "beta"}.issubset(names))
+
+            removed = self._run(temporary, "agent", "remove", "alpha", "beta")
+            self.assertEqual(removed.returncode, 0, removed.stderr)
+            self.assertIn("removed agents alpha, beta", removed.stdout)
+            self.assertIn("Restart connected harnesses", removed.stdout)
+            names = {
+                agent["name"]
+                for agent in self._load(temporary)["profiles"]["default"]["agents"]
+            }
+            self.assertTrue({"alpha", "beta"}.isdisjoint(names))
+
+    def test_agent_edit_conversion_errors_are_clean(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self._initialize(temporary)
+            name = self._load(temporary)["profiles"]["default"]["agents"][0]["name"]
+            original = Path(temporary, "config.json").read_text(encoding="utf-8")
+
+            invalid_integer = self._run(
+                temporary, "agent", "edit", name, "priority=not-a-number"
+            )
+            malformed_json = self._run(
+                temporary, "agent", "edit", name, "extra_args=["
+            )
+
+            self.assertEqual(invalid_integer.returncode, 2)
+            self.assertEqual(len(invalid_integer.stderr.splitlines()), 1)
+            self.assertIn("priority must be an integer", invalid_integer.stderr)
+            self.assertNotIn("Traceback", invalid_integer.stderr)
+            self.assertEqual(malformed_json.returncode, 2)
+            self.assertEqual(len(malformed_json.stderr.splitlines()), 1)
+            self.assertIn("extra_args must be valid JSON", malformed_json.stderr)
+            self.assertNotIn("Traceback", malformed_json.stderr)
+            self.assertEqual(
+                Path(temporary, "config.json").read_text(encoding="utf-8"),
+                original,
+            )
 
 
 if __name__ == "__main__":
