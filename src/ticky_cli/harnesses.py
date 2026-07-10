@@ -40,6 +40,50 @@ def mcp_json(profile_name: str | None = None) -> dict[str, Any]:
     }
 
 
+def _registration_config(target: str) -> Path:
+    relative = ".claude.json" if target == "claude" else ".codex/config.toml"
+    return Path(os.path.expanduser(f"~/{relative}"))
+
+
+def _snapshot_registration(path: Path) -> tuple[bool, bytes, int | None]:
+    if not path.exists():
+        return False, b"", None
+    metadata = path.stat()
+    return True, path.read_bytes(), metadata.st_mode & 0o777
+
+
+def _restore_registration(
+    path: Path,
+    snapshot: tuple[bool, bytes, int | None],
+) -> str | None:
+    existed, contents, mode = snapshot
+    try:
+        if not existed:
+            path.unlink(missing_ok=True)
+            return None
+        temporary = path.with_name(f".{path.name}.ticky-rollback-{os.getpid()}")
+        temporary.write_bytes(contents)
+        if mode is not None:
+            temporary.chmod(mode)
+        os.replace(temporary, path)
+    except OSError as error:
+        return str(error)
+    return None
+
+
+def _registration_failure(
+    detail: str,
+    config_path: Path,
+    snapshot: tuple[bool, bytes, int | None],
+) -> tuple[bool, str]:
+    rollback_error = _restore_registration(config_path, snapshot)
+    if rollback_error:
+        return False, f"{detail}; rollback failed: {rollback_error}"
+    if snapshot[0]:
+        return False, f"{detail}; previous registration restored"
+    return False, f"{detail}; partial registration removed"
+
+
 def _codex_auto_approval() -> bool:
     try:
         import tomllib
@@ -86,39 +130,57 @@ def _codex_auto_approval() -> bool:
 
 
 def install(target: str, profile_name: str | None = None) -> tuple[bool, str]:
+    if target not in ("claude", "codex"):
+        return False, f"unknown harness {target!r}"
+    if not shutil.which(target):
+        return False, f"{target} CLI not found"
+
+    config_path = _registration_config(target)
+    try:
+        snapshot = _snapshot_registration(config_path)
+    except OSError as error:
+        return False, f"could not back up {target} registration: {error}"
+
     path = executable_path()
     arguments = server_args(profile_name)
     if target == "claude":
-        if not shutil.which("claude"):
-            return False, "claude CLI not found"
-        subprocess.run(
-            ["claude", "mcp", "remove", "--scope", "user", "ticky"],
-            capture_output=True,
-            text=True,
-        )
-        result = subprocess.run(
-            ["claude", "mcp", "add", "--scope", "user", "ticky", "--", path, *arguments],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            subprocess.run(
+                ["claude", "mcp", "remove", "--scope", "user", "ticky"],
+                capture_output=True,
+                text=True,
+            )
+            result = subprocess.run(
+                ["claude", "mcp", "add", "--scope", "user", "ticky", "--", path, *arguments],
+                capture_output=True,
+                text=True,
+            )
+        except OSError as error:
+            return _registration_failure(
+                f"registration command failed: {error}", config_path, snapshot
+            )
         if result.returncode:
-            return False, result.stderr.strip() or result.stdout.strip() or "registration failed"
+            detail = result.stderr.strip() or result.stdout.strip() or "registration failed"
+            return _registration_failure(detail, config_path, snapshot)
         return True, "registered in Claude Code user scope"
-    if target == "codex":
-        if not shutil.which("codex"):
-            return False, "codex CLI not found"
+
+    try:
         subprocess.run(["codex", "mcp", "remove", "ticky"], capture_output=True, text=True)
         result = subprocess.run(
             ["codex", "mcp", "add", "ticky", "--", path, *arguments],
             capture_output=True,
             text=True,
         )
-        if result.returncode:
-            return False, result.stderr.strip() or result.stdout.strip() or "registration failed"
-        approved = _codex_auto_approval()
-        suffix = " and enabled tool approval" if approved else "; tool auto-approval was not changed"
-        return True, "registered in Codex" + suffix
-    return False, f"unknown harness {target!r}"
+    except OSError as error:
+        return _registration_failure(
+            f"registration command failed: {error}", config_path, snapshot
+        )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or "registration failed"
+        return _registration_failure(detail, config_path, snapshot)
+    approved = _codex_auto_approval()
+    suffix = " and enabled tool approval" if approved else "; tool auto-approval was not changed"
+    return True, "registered in Codex" + suffix
 
 
 def uninstall(target: str) -> tuple[bool, str]:

@@ -6,3 +6,13 @@ dist/
 *.egg-info/
 .DS_Store
 
+# Local ticky state and credentials
+/.ticky/
+/.env
+/.env.*
+/accounts/
+/calls.jsonl
+/config.json
+/config.v1.json
+/state.json
+/state.lock
