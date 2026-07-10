@@ -12,7 +12,7 @@ elif ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'; th
   result=1
 else
   printf '\nStarting ticky setup...\n\n'
-  if "$ROOT/ticky" init --yes; then
+  if "$ROOT/ticky" init; then
     printf '\nChecking ticky status...\n\n'
     if "$ROOT/ticky" status; then
       printf '\nTicky is ready. Restart connected Codex or Claude sessions to refresh their agent tools.\n'
