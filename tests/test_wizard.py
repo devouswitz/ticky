@@ -162,8 +162,10 @@ class CliIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             answers = [
                 "codex",           # providers
-                "",                # build roster now? default yes
-                "",                # add first agent now? default yes
+                "",                # existing login
+                "",                # account label
+                "",                # account id
+                "",                # do not replace an existing login
                 "Scout",           # name
                 "",                # model
                 "",                # thinking
@@ -173,32 +175,42 @@ class CliIntegrationTests(unittest.TestCase):
                 "",                # timeout
                 "Recon and research",
                 "",                # routing note
-                "",                # action: done
+                "",                # add another agent: no
+                "Prefer Scout for research.",
             ]
             args = argparse.Namespace(yes=False, provider=None, no_install=True, no_link=True)
             with (
                 mock.patch.dict(os.environ, {"TICKY_HOME": temporary}),
                 mock.patch("ticky_cli.cli.sys.stdin.isatty", return_value=True),
+                mock.patch("ticky_cli.setup_wizard.subprocess.run") as login,
                 scripted(answers),
                 redirect_stdout(io.StringIO()),
             ):
                 code = cli.cmd_init(args)
+            login.assert_not_called()
             self.assertEqual(code, 0)
             saved = json.loads(Path(temporary, "config.json").read_text())
             agents = saved["profiles"]["default"]["agents"]
             self.assertEqual([agent["name"] for agent in agents], ["scout"])
             self.assertIn("codex-default", saved["accounts"])
 
-    def test_init_interactive_declining_wizard_keeps_seeded_agents(self):
+    def test_init_interactive_accepting_defaults_keeps_seeded_agent(self):
         with tempfile.TemporaryDirectory() as temporary:
             args = argparse.Namespace(yes=False, provider=None, no_install=True, no_link=True)
+            answers = [
+                "codex", "", "", "", "",  # provider and account
+                "", "", "", "", "", "", "", "", "",  # seeded agent
+                "", "",  # no extra agent, keep general directions
+            ]
             with (
                 mock.patch.dict(os.environ, {"TICKY_HOME": temporary}),
                 mock.patch("ticky_cli.cli.sys.stdin.isatty", return_value=True),
-                scripted(["codex", "n"]),
+                mock.patch("ticky_cli.setup_wizard.subprocess.run") as login,
+                scripted(answers),
                 redirect_stdout(io.StringIO()),
             ):
                 code = cli.cmd_init(args)
+            login.assert_not_called()
             self.assertEqual(code, 0)
             saved = json.loads(Path(temporary, "config.json").read_text())
             self.assertEqual(len(saved["profiles"]["default"]["agents"]), 1)
@@ -278,8 +290,9 @@ class CliIntegrationTests(unittest.TestCase):
             config["profiles"]["default"]["agents"] = []
             store.save(config)
             answers = [
-                "",                # build the empty roster now? default yes
-                "",                # add first agent now? default yes
+                "",                # keep codex provider selection
+                "",                # keep existing account
+                "",                # review roster
                 "Scout",           # name
                 "",                # model
                 "",                # thinking
@@ -289,7 +302,8 @@ class CliIntegrationTests(unittest.TestCase):
                 "",                # timeout
                 "Recon",           # specialty
                 "",                # routing note
-                "",                # action: done
+                "",                # add another agent: no
+                "",                # keep general directions
             ]
             args = argparse.Namespace(yes=False, provider=None, no_install=True, no_link=True)
             with (

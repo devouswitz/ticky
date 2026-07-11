@@ -104,17 +104,60 @@ def roster_text(config: dict[str, Any], profile_name: str, paths: AppPaths) -> s
 
 class McpServer:
     def __init__(self, config: dict[str, Any], paths: AppPaths, profile_name: str | None = None,
-                 *, source: TextIO | None = None, sink: TextIO | None = None):
+                 *, source: TextIO | None = None, sink: TextIO | None = None,
+                 store: ConfigStore | None = None):
         selected_name, _ = profile(config, profile_name)
         self.config = config
         self.paths = paths
         self.profile_name = selected_name
+        self.pinned_profile = profile_name is not None
         self.source = source or sys.stdin
         self.sink = sink or sys.stdout
         self.boss = "unknown"
         self._output_lock = threading.Lock()
         self._workers: list[threading.Thread] = []
         self.activity = Activity(paths, f"serve-{os.getpid()}-{id(self)}")
+        self.store = store
+        self._config_mtime = self._config_stamp()
+
+    def _config_stamp(self) -> int | None:
+        if self.store is None:
+            return None
+        try:
+            return self.store.paths.config.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def refresh_config(self) -> None:
+        """Pick up config edits made while the server is running.
+
+        The previous behavior held the config loaded at startup for the
+        server's whole life, so `ticky agent edit` had no effect on live
+        harness sessions until they restarted.
+        """
+        if self.store is None:
+            return
+        stamp = self._config_stamp()
+        if stamp is None or stamp == self._config_mtime:
+            return
+        try:
+            data = self.store.load()
+        except ConfigError as error:
+            print(f"ticky: keeping previous config; reload failed: {error}", file=sys.stderr)
+            self._config_mtime = stamp
+            return
+        if data is None:
+            return
+        self._config_mtime = stamp
+        if not self.pinned_profile:
+            self.profile_name = data["active_profile"]
+        elif self.profile_name not in data["profiles"]:
+            print(
+                f"ticky: profile {self.profile_name!r} no longer exists; using active profile",
+                file=sys.stderr,
+            )
+            self.profile_name = data["active_profile"]
+        self.config = data
 
     def send(self, value: dict[str, Any]) -> None:
         with self._output_lock:
@@ -189,6 +232,8 @@ class McpServer:
         method = message.get("method")
         request_id = message.get("id")
         params = message.get("params") or {}
+        if method in ("tools/list", "tools/call"):
+            self.refresh_config()
         if method == "initialize":
             client = params.get("clientInfo") or {}
             self.boss = str(client.get("name") or "unknown")
@@ -222,6 +267,7 @@ class McpServer:
             definitions.append(roster_definition())
             self.reply(request_id, {"tools": definitions})
         elif method == "tools/call":
+            self._workers = [worker for worker in self._workers if worker.is_alive()]
             worker = threading.Thread(target=self._call, args=(request_id, params), daemon=True)
             self._workers.append(worker)
             worker.start()
@@ -238,6 +284,10 @@ class McpServer:
                 try:
                     value = json.loads(stripped)
                 except json.JSONDecodeError:
+                    print(
+                        f"ticky: ignoring malformed MCP input line ({stripped[:80]!r})",
+                        file=sys.stderr,
+                    )
                     continue
                 messages = value if isinstance(value, list) else [value]
                 for message in messages:
@@ -260,10 +310,10 @@ def serve(profile_name: str | None = None, config_override: str | None = None) -
     if config_override:
         data = json.loads(Path(config_override).read_text(encoding="utf-8"))
         validate_config(data)
-        server_paths = paths
+        live_store = None
     else:
         data = store.load()
-        server_paths = paths
+        live_store = store
     if data is None:
         raise ConfigError("no config found")
-    McpServer(data, server_paths, profile_name).serve()
+    McpServer(data, paths, profile_name, store=live_store).serve()
