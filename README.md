@@ -1,4 +1,4 @@
-# ticky
+# ticky!
 
 **Turn your AI CLI accounts into named subagents that any MCP-capable harness can call.**
 
