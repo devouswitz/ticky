@@ -26,7 +26,7 @@ The same guided setup is available at any time with `/setup` inside the interact
 
 ## Get started
 
-On macOS, double-click **`Start Ticky.command`**. On Windows 10 or 11, double-click **`Start Ticky.cmd`**. The launchers run setup when needed, check the configured accounts, and open the Ticky session.
+On macOS, double-click **`Start Ticky.command`**. On Windows 10 or 11, double-click **`Start Ticky.cmd`**. The launchers run setup when needed, check the configured accounts on every launch, and open the Ticky session. Launcher setup changes only the selected Ticky home. It does not register MCP servers or create a global `ticky` command. Connect a harness explicitly with `./ticky install codex` or `./ticky install claude` from the checkout.
 
 From a terminal:
 
@@ -168,7 +168,7 @@ Access levels are deliberately explicit:
 | `workspace-write` | workspace sandbox | edits allowed, Bash blocked | auto-edit mode | write tools allowed, shell removed | text-only |
 | `full` | danger-full-access | bypass permissions | yolo mode | bypass permissions | text-only |
 
-Codex network access is enabled only when an agent has `workspace-write` and `network=true`. Ticky never silently promotes a safer access level when a provider command fails.
+Codex network access is enabled only when an agent has `workspace-write` and `network=true`. Guided setup requires a separate confirmation before saving `full` access. Ticky never silently promotes a safer access level when a provider command fails.
 
 ## Harness integration
 
@@ -181,6 +181,8 @@ ticky install all
 ticky uninstall codex
 ticky uninstall claude
 ```
+
+`ticky install codex` writes the user-level `mcp_servers.ticky` entry and sets only that server's tool approval mode to `writes`. Codex can use read-only Ticky agents without another prompt and asks before agents marked as write-capable. It does not change the approval default for other MCP servers.
 
 For any other MCP-capable harness:
 
@@ -201,7 +203,7 @@ ticky log -f
 ticky log -n 50
 ```
 
-Logs contain call metadata such as the boss, profile, agent, provider, model, effort, access, reason, status, and duration. They never contain provider output or secrets. `ticky doctor` exercises the MCP handshake, tool list, mock dispatch, live-state cleanup, and completion log without spending model credits or changing the active roster.
+Logs contain call metadata such as the boss, profile, agent, provider, model, effort, access, caller-supplied reason, status, and duration. Ticky does not copy the `task` field, provider output, or secrets into the log. Keep reasons concise because they are retained. `ticky doctor` exercises the MCP handshake, tool list, mock dispatch, live-state cleanup, and completion log without spending model credits or changing the active roster.
 
 ## Files and privacy
 
@@ -210,11 +212,12 @@ Logs contain call metadata such as the boss, profile, agent, provider, model, ef
 ~/.ticky/config.v1.json               one-time schema v1 migration backup
 ~/.ticky/accounts/<id>/home/          isolated provider CLI home
 ~/.ticky/accounts/<id>/env            private account secrets
-~/.ticky/calls.jsonl                  completed call metadata
+~/.ticky/calls.jsonl                  completed call metadata, mode 0600 on macOS and Linux
 ~/.ticky/state.json                   currently running calls
+~/.ticky/history                      up to 500 interactive inputs, mode 0600 on macOS and Linux
 ```
 
-The first command that reads a schema v1 config migrates it to schema v2, preserving the roster and routing preferences while leaving credentials and call history untouched.
+Interactive history includes commands and task text entered in `ticky ui`. Delete `~/.ticky/history` to clear it. If `calls.jsonl` predates the metadata-only logging behavior, delete it to remove older records that may contain task previews. The first command that reads a schema v1 config migrates it to schema v2, preserving the roster and routing preferences while leaving credentials and call history untouched.
 
 ## Source map
 

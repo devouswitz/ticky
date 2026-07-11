@@ -215,7 +215,6 @@ class McpServer:
             agent=agent,
             account=account,
             reason=reason,
-            task=task,
         )
         started = time.monotonic()
         try:

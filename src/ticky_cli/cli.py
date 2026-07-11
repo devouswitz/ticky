@@ -188,7 +188,10 @@ def cmd_init(args: argparse.Namespace) -> int:
     ):
         print("Ollama agents still need an installed model; set one with `/model` or `ticky agent edit`.")
     print("Next: `ticky`, `/setup`, `ticky account status`, or `ticky agent list`.")
-    print("Restart connected harnesses after changing profiles or agent tools.")
+    if args.no_install:
+        print("Harness registration was skipped. Run `ticky install codex` or `ticky install claude` when ready.")
+    else:
+        print("Restart connected harnesses after changing profiles or agent tools.")
     return code
 
 
@@ -658,7 +661,7 @@ def cmd_call(args: argparse.Namespace) -> int:
     activity = Activity(store.paths, f"manual-{os.getpid()}")
     call_id = activity.start(
         boss="terminal", profile=profile_name, agent=record, account=account,
-        reason=reason, task=args.task,
+        reason=reason,
     )
     try:
         result = run_agent(store.paths, account, record, args.task, args.context)

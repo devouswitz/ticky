@@ -80,6 +80,36 @@ class HarnessInstallTests(unittest.TestCase):
             self.assertIn("previous registration restored", message)
             self.assertEqual(config_path.read_bytes(), original)
 
+    def test_codex_registration_prompts_for_write_capable_ticky_tools(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary, ".codex", "config.toml")
+            config_path.parent.mkdir(parents=True)
+
+            def run(command, **_kwargs):
+                if "add" in command:
+                    config_path.write_text(
+                        "[mcp_servers.ticky]\n"
+                        "command = \"/tmp/ticky\"\n"
+                        "args = [\"serve\"]\n"
+                        "default_tools_approval_mode = \"approve\"\n",
+                        encoding="utf-8",
+                    )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                mock.patch.dict(os.environ, {"HOME": temporary}),
+                mock.patch("ticky_cli.harnesses.shutil.which", return_value="codex"),
+                mock.patch("ticky_cli.harnesses.executable_path", return_value="/tmp/ticky"),
+                mock.patch("ticky_cli.harnesses.subprocess.run", side_effect=run),
+            ):
+                ok, message = install("codex", "default")
+
+            self.assertTrue(ok, message)
+            updated = config_path.read_text(encoding="utf-8")
+            self.assertIn('default_tools_approval_mode = "writes"', updated)
+            self.assertNotIn('default_tools_approval_mode = "approve"', updated)
+            self.assertIn("write-capable tools", message)
+
 
 if __name__ == "__main__":
     unittest.main()
