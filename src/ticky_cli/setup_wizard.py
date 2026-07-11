@@ -81,11 +81,15 @@ def _choose_providers(config: dict[str, Any] | None,
     for provider in SETUP_PROVIDERS:
         installed = "installed" if shutil.which(PROVIDER_EXECUTABLES[provider]) else "not installed"
         print(f"  {provider:<7} {PROVIDER_LABELS[provider]} ({installed})")
-    raw = ask(
-        "Providers, comma-separated (aliases: google, xai, local)",
-        ",".join(defaults),
-    )
-    return parse_provider_selection(raw)
+    while True:
+        raw = ask(
+            "Providers, comma-separated (aliases: google, xai, local)",
+            ",".join(defaults),
+        )
+        try:
+            return parse_provider_selection(raw)
+        except ConfigError as error:
+            print(error)
 
 
 def _unused_account_id(config: dict[str, Any], base: str) -> str:
@@ -133,11 +137,39 @@ def _configure_provider_account(store: ConfigStore, config: dict[str, Any],
         if ask_bool("Keep these account settings", True):
             return [account["id"] for account in existing]
 
+    account: dict[str, Any] | None = None
+    if existing:
+        action = ask_choice(
+            "Account change",
+            ("add", "edit"),
+            "add",
+            {
+                "add": "create another login for this provider",
+                "edit": "change one of the accounts shown above",
+            },
+        )
+        if action == "edit":
+            if len(existing) == 1:
+                account = existing[0]
+            else:
+                selected_id = ask_choice(
+                    "Account to edit",
+                    tuple(item["id"] for item in existing),
+                    existing[0]["id"],
+                )
+                account = next(item for item in existing if item["id"] == selected_id)
+
     print(f"\nLink {PROVIDER_LABELS[provider]}")
     if provider == "ollama":
         print("  Local Ollama models need no login. Existing login also covers Ollama Cloud models.")
+    current_auth = account.get("auth", "inherit") if account is not None else "inherit"
+    default_auth_choice = {
+        "inherit": "existing-login",
+        "isolated": "separate-login",
+        "api-key": "api-key",
+    }[current_auth]
     auth_choice = ask_choice(
-        "Authentication", AUTH_CHOICES, "existing-login", AUTH_HELP,
+        "Authentication", AUTH_CHOICES, default_auth_choice, AUTH_HELP,
     )
     auth = {
         "existing-login": "inherit",
@@ -146,17 +178,23 @@ def _configure_provider_account(store: ConfigStore, config: dict[str, Any],
     }[auth_choice]
     suffix = {"inherit": "default", "isolated": "private", "api-key": "api"}[auth]
     default_id = f"{provider}-{suffix}"
-    if existing:
-        account = existing[0]
+    if account is not None:
         account["auth"] = auth
         account_id = account["id"]
         account["label"] = ask("Account label", account.get("label") or account_id)
     else:
         label = ask("Account label", f"{PROVIDER_LABELS[provider]} account")
-        account_id = ask("Account id", _unused_account_id(config, default_id))
-        account_id = slugify(account_id)
-        if account_id in config["accounts"]:
-            raise ConfigError(f"account {account_id!r} already exists")
+        while True:
+            raw_id = ask("Account id", _unused_account_id(config, default_id))
+            try:
+                account_id = slugify(raw_id)
+            except ConfigError as error:
+                print(error)
+                continue
+            if account_id in config["accounts"]:
+                print(f"account {account_id!r} already exists; choose another id")
+                continue
+            break
         account = account_record(account_id, provider, label, auth)
         config["accounts"][account_id] = account
 

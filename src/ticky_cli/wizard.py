@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import textwrap
+from pathlib import Path
 from typing import Any, Sequence
 
 from .config import (
@@ -100,6 +102,18 @@ def ask_choice(label: str, options: Sequence[str], default: str,
         print(f"Enter a number from 1 to {len(options)} or one of: {', '.join(options)}.")
 
 
+def ask_workdir(default: str) -> str:
+    while True:
+        value = ask("Working directory", default)
+        path = Path(os.path.expanduser(value))
+        if path.is_dir():
+            return value
+        if path.exists():
+            print(f"Working directory is not a directory: {path}")
+        else:
+            print(f"Working directory does not exist: {path}")
+
+
 def choose_account(config: dict[str, Any], default: str | None = None) -> str:
     enabled = sorted(
         account_id for account_id, account in config["accounts"].items()
@@ -163,14 +177,24 @@ def prompt_agent(config: dict[str, Any], existing: Sequence[str],
     record["thinking"] = ask_choice(
         "Thinking effort", THINKING_LEVELS, record.get("thinking") or "default",
     )
-    record["access"] = ask_choice(
-        "Access level", ACCESS_LEVELS, record.get("access") or "read-only", ACCESS_HELP,
-    )
+    access_default = record.get("access") or "read-only"
+    while True:
+        access = ask_choice("Access level", ACCESS_LEVELS, access_default, ACCESS_HELP)
+        if access != "full" or ask_bool(
+            "Full access can disable sandbox and provider permission safeguards. Enable it",
+            False,
+        ):
+            record["access"] = access
+            break
+        print("Full access was not enabled. Choose an access level again.")
+        access_default = "read-only"
     if record["access"] == "workspace-write" and provider == "codex":
         record["network"] = ask_bool(
             "Allow network access inside the sandbox", bool(record.get("network")),
         )
-    record["workdir"] = ask("Working directory", record.get("workdir") or "~")
+    else:
+        record["network"] = False
+    record["workdir"] = ask_workdir(record.get("workdir") or "~")
     record["priority"] = ask_int("Priority (1 = boss calls first)", int(record.get("priority") or 2))
     record["timeout"] = ask_int("Timeout in seconds", int(record.get("timeout") or 900))
     record["specialty"] = ask(

@@ -82,7 +82,27 @@ class McpAndActivityBehaviorTests(unittest.TestCase):
             self.assertEqual(entries[0]["profile"], "default")
             self.assertEqual(entries[0]["account"], "mock-default")
             self.assertEqual(entries[0]["thinking"], "high")
+            self.assertNotIn("task_preview", entries[0])
+            self.assertNotIn("Check the setup screen", paths.calls.read_text(encoding="utf-8"))
+            if os.name != "nt":
+                self.assertEqual(paths.calls.stat().st_mode & 0o777, 0o600)
             self.assertEqual(read_state(paths)["running"], [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits are not Windows ACLs")
+    def test_log_access_repairs_an_existing_public_file_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = AppPaths(Path(temporary))
+            paths.ensure()
+            paths.calls.write_text('{"status": "old"}\n', encoding="utf-8")
+            paths.calls.chmod(0o644)
+
+            self.assertEqual(read_log_tail(paths, 1)[0]["status"], "old")
+            self.assertEqual(paths.calls.stat().st_mode & 0o777, 0o600)
+
+            paths.calls.chmod(0o644)
+            append_log(paths, {"status": "ok"})
+
+            self.assertEqual(paths.calls.stat().st_mode & 0o777, 0o600)
 
     def test_state_merges_independent_sessions(self):
         with tempfile.TemporaryDirectory() as temporary:

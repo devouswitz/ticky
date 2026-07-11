@@ -94,7 +94,7 @@ def _registration_failure(
     return False, f"{detail}; partial registration removed"
 
 
-def _codex_auto_approval() -> bool:
+def _codex_write_approval() -> bool:
     try:
         import tomllib
     except ImportError:
@@ -112,7 +112,7 @@ def _codex_auto_approval() -> bool:
         stripped = line.strip()
         if stripped.startswith("["):
             if in_section and not inserted:
-                output.append('default_tools_approval_mode = "approve"')
+                output.append('default_tools_approval_mode = "writes"')
                 inserted = True
             in_section = stripped == "[mcp_servers.ticky]"
             if in_section:
@@ -121,12 +121,12 @@ def _codex_auto_approval() -> bool:
             continue
         if in_section and stripped.startswith("default_tools_approval_mode"):
             if not inserted:
-                output.append('default_tools_approval_mode = "approve"')
+                output.append('default_tools_approval_mode = "writes"')
                 inserted = True
             continue
         output.append(line)
     if in_section and not inserted:
-        output.append('default_tools_approval_mode = "approve"')
+        output.append('default_tools_approval_mode = "writes"')
         inserted = True
     if not found:
         return False
@@ -187,8 +187,11 @@ def install(target: str, profile_name: str | None = None) -> tuple[bool, str]:
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip() or "registration failed"
         return _registration_failure(detail, config_path, snapshot)
-    approved = _codex_auto_approval()
-    suffix = " and enabled tool approval" if approved else "; tool auto-approval was not changed"
+    approval_configured = _codex_write_approval()
+    suffix = (
+        " and enabled prompts for write-capable tools"
+        if approval_configured else "; tool approval mode was not changed"
+    )
     return True, "registered in Codex" + suffix
 
 

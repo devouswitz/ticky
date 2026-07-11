@@ -31,23 +31,15 @@ if defined TICKY_HOME (
   set "TICKY_CONFIG=%USERPROFILE%\.ticky\config.json"
 )
 
-if exist "%TICKY_CONFIG%" (
-  %PYTHON% "%~dp0ticky" ui
-  set "RESULT=%ERRORLEVEL%"
-  goto finish
-)
+if exist "%TICKY_CONFIG%" goto check_status
 
 echo.
 echo Starting Ticky setup...
 echo.
-%PYTHON% "%~dp0ticky" setup
-if errorlevel 1 (
-  set "RESULT=%ERRORLEVEL%"
-  echo.
-  echo Ticky setup did not finish successfully.
-  goto finish
-)
+%PYTHON% "%~dp0ticky" setup --no-install --no-link
+if errorlevel 1 goto setup_failed
 
+:check_status
 echo.
 echo Checking Ticky status...
 echo.
@@ -55,22 +47,30 @@ echo.
 if errorlevel 1 (
   set "RESULT=%ERRORLEVEL%"
   echo.
-  echo Setup was saved, but one or more status checks need attention.
+  echo Ticky status needs attention.
   goto finish
 )
 %PYTHON% "%~dp0ticky" account status
 if errorlevel 1 (
   set "RESULT=%ERRORLEVEL%"
   echo.
-  echo Setup was saved, but one or more provider connections need attention.
+  echo One or more provider connections need attention.
   goto finish
 )
 
 echo.
-echo Ticky is ready. Restart connected Codex or Claude sessions to refresh agent tools.
+echo Ticky is ready. To connect a harness, run one of:
+echo   %PYTHON% "%~dp0ticky" install codex
+echo   %PYTHON% "%~dp0ticky" install claude
 echo.
 %PYTHON% "%~dp0ticky" ui
 set "RESULT=%ERRORLEVEL%"
+goto finish
+
+:setup_failed
+set "RESULT=%ERRORLEVEL%"
+echo.
+echo Ticky setup did not finish successfully.
 
 :finish
 echo.

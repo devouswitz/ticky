@@ -120,7 +120,14 @@ def append_log(paths: AppPaths, entry: dict[str, Any]) -> None:
     paths.ensure()
     lock = paths.root / "calls.lock"
     with locked_file(lock):
-        with paths.calls.open("a", encoding="utf-8") as handle:
+        descriptor = os.open(paths.calls, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
+        except OSError:
+            os.close(descriptor)
+            raise
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -129,6 +136,8 @@ def append_log(paths: AppPaths, entry: dict[str, Any]) -> None:
 def read_log_tail(paths: AppPaths, count: int = 20) -> list[dict[str, Any]]:
     try:
         with paths.calls.open("rb") as handle:
+            if os.name != "nt":
+                os.fchmod(handle.fileno(), 0o600)
             handle.seek(0, os.SEEK_END)
             size = handle.tell()
             block = min(size, max(8192, count * 1024))
@@ -153,7 +162,7 @@ class Activity:
         self._lock = threading.Lock()
 
     def start(self, *, boss: str, profile: str, agent: dict[str, Any],
-              account: dict[str, Any], reason: str, task: str) -> str:
+              account: dict[str, Any], reason: str) -> str:
         call_id = uuid.uuid4().hex
         call = {
             "call_id": call_id,
@@ -168,7 +177,6 @@ class Activity:
             "thinking": agent.get("thinking", "default"),
             "access": agent["access"],
             "reason": reason,
-            "task_preview": task[:200],
         }
         with self._lock:
             self._running[call_id] = call

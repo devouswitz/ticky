@@ -125,7 +125,7 @@ def pick_agent(config: dict[str, Any], profile_name: str,
                requested: str | None = None) -> dict[str, Any]:
     agents = enabled_agents(config, profile_name)
     if not agents:
-        raise ConfigError("no enabled agents in the active profile; run `ticky roster`")
+        raise ConfigError("no enabled agents in the active profile; use `/roster` to add one")
     if requested:
         slug = slugify(requested)
         for agent in agents:
@@ -341,7 +341,7 @@ class Session:
         reason = "interactive ticky session"
         call_id = self.activity.start(
             boss=BOSS_LABEL, profile=self.profile_name, agent=agent, account=account,
-            reason=reason, task=task,
+            reason=reason,
         )
         self._seen_calls.add(call_id)
         run = AgentRun(self.paths, account, agent, task, context)
@@ -441,6 +441,8 @@ class Session:
             self._command_setup()
         elif name == "/agents":
             agents = enabled_agents(self.config, self.profile_name)
+            if not agents:
+                self.say_dim("No enabled agents in this profile. Use /roster to add or enable one.")
             for agent in agents:
                 account = self.config["accounts"][agent["account"]]
                 model = agent.get("model") or "default"
@@ -597,14 +599,19 @@ class Session:
             # The wizard edits self.config in place and saves after each action;
             # an abort mid-prompt leaves unsaved mutations in memory, so always
             # reload the last saved state from disk.
-            try:
-                self.config = self.store.load()
-            except ConfigError as error:
-                self.say(self.style.err(f"config reload failed: {error}"))
-            self._config_mtime = self._config_stamp()
-            if self.profile_name not in self.config["profiles"]:
-                self.profile_name = self.config["active_profile"]
-            self._drop_stale_pin()
+            self._reload_after_wizard(follow_active_profile=False)
+
+    def _reload_after_wizard(self, *, follow_active_profile: bool) -> None:
+        try:
+            reloaded = self.store.load()
+        except ConfigError as error:
+            self.say(self.style.err(f"config reload failed: {error}"))
+            return
+        self.config = reloaded
+        self._config_mtime = self._config_stamp()
+        if follow_active_profile or self.profile_name not in self.config["profiles"]:
+            self.profile_name = self.config["active_profile"]
+        self._drop_stale_pin()
 
     def _command_setup(self) -> None:
         from .setup_wizard import run_setup_wizard
@@ -616,14 +623,7 @@ class Session:
         except ConfigError as error:
             self.say(self.style.err(str(error)))
         finally:
-            try:
-                self.config = self.store.load()
-            except ConfigError as error:
-                self.say(self.style.err(f"config reload failed: {error}"))
-                return
-            self._config_mtime = self._config_stamp()
-            self.profile_name = self.config["active_profile"]
-            self._drop_stale_pin()
+            self._reload_after_wizard(follow_active_profile=True)
 
     def _command_profile(self, args: list[str]) -> None:
         style = self.style
@@ -725,6 +725,8 @@ class Session:
         history = self.paths.root / "history"
         try:
             readline.read_history_file(str(history))
+            if os.name != "nt":
+                history.chmod(0o600)
         except (FileNotFoundError, OSError):
             pass
         import atexit
@@ -749,6 +751,8 @@ class Session:
         try:
             readline.set_history_length(500)
             readline.write_history_file(str(history))
+            if os.name != "nt":
+                history.chmod(0o600)
         except OSError:
             pass
 

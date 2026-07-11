@@ -33,22 +33,23 @@ def _agent_add_args(**overrides):
 
 class PromptAgentTests(unittest.TestCase):
     def test_all_fields_are_collected(self):
-        config = new_config(["codex", "claude"])
-        answers = [
-            "Rook",            # name
-            "2",               # account: sorted -> claude-default, codex-default
-            "gpt-5.5",         # model
-            "xhigh",           # thinking
-            "2",               # access: workspace-write
-            "y",               # network (codex + workspace-write)
-            "~/projects",      # workdir
-            "1",               # priority
-            "600",             # timeout
-            "Deep audits and second opinions",
-            "Call first for verification-shaped tasks",
-        ]
-        with scripted(answers), redirect_stdout(io.StringIO()):
-            record = prompt_agent(config, [])
+        with tempfile.TemporaryDirectory() as temporary:
+            config = new_config(["codex", "claude"])
+            answers = [
+                "Rook",            # name
+                "2",               # account: sorted -> claude-default, codex-default
+                "gpt-5.5",         # model
+                "xhigh",           # thinking
+                "2",               # access: workspace-write
+                "y",               # network (codex + workspace-write)
+                temporary,          # workdir
+                "1",               # priority
+                "600",             # timeout
+                "Deep audits and second opinions",
+                "Call first for verification-shaped tasks",
+            ]
+            with scripted(answers), redirect_stdout(io.StringIO()):
+                record = prompt_agent(config, [])
         self.assertEqual(record["name"], "rook")
         self.assertEqual(record["display"], "Rook")
         self.assertEqual(record["account"], "codex-default")
@@ -56,7 +57,7 @@ class PromptAgentTests(unittest.TestCase):
         self.assertEqual(record["thinking"], "xhigh")
         self.assertEqual(record["access"], "workspace-write")
         self.assertTrue(record["network"])
-        self.assertEqual(record["workdir"], "~/projects")
+        self.assertEqual(record["workdir"], temporary)
         self.assertEqual(record["priority"], 1)
         self.assertEqual(record["timeout"], 600)
         self.assertEqual(record["specialty"], "Deep audits and second opinions")
@@ -81,6 +82,33 @@ class PromptAgentTests(unittest.TestCase):
         self.assertEqual(record["name"], "wren")
         self.assertEqual(record["access"], "read-only")
         self.assertEqual(record["model"], None)
+
+    def test_missing_workdir_is_reprompted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = str(Path(temporary, "missing"))
+            answers = [
+                "Scout", "", "", "", missing, temporary,
+                "", "", "Research", "",
+            ]
+            output = io.StringIO()
+            with scripted(answers), redirect_stdout(output):
+                record = prompt_agent(new_config(["codex"]), [])
+
+            self.assertEqual(record["workdir"], temporary)
+            self.assertIn("does not exist", output.getvalue())
+
+    def test_full_access_requires_a_second_confirmation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            answers = [
+                "Scout", "", "", "full", "n", "read-only", temporary,
+                "", "", "Research", "",
+            ]
+            output = io.StringIO()
+            with scripted(answers), redirect_stdout(output):
+                record = prompt_agent(new_config(["codex"]), [])
+
+            self.assertEqual(record["access"], "read-only")
+            self.assertIn("Full access was not enabled", output.getvalue())
 
     def test_eof_becomes_config_error(self):
         config = new_config(["codex"])
@@ -220,7 +248,7 @@ class CliIntegrationTests(unittest.TestCase):
             store = ConfigStore(AppPaths(Path(temporary)))
             store.save(new_config(["codex"]))
             answers = [
-                "Wren",            # name
+                "Research Helper", # name outside the random production pool
                 "",                # model
                 "",                # thinking
                 "",                # access
@@ -241,8 +269,12 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertEqual(code, 0)
             saved = json.loads(Path(temporary, "config.json").read_text())
             names = [agent["name"] for agent in saved["profiles"]["default"]["agents"]]
-            self.assertIn("wren", names)
-            added = next(agent for agent in saved["profiles"]["default"]["agents"] if agent["name"] == "wren")
+            self.assertIn("research-helper", names)
+            added = next(
+                agent
+                for agent in saved["profiles"]["default"]["agents"]
+                if agent["name"] == "research-helper"
+            )
             self.assertEqual(added["specialty"], "Research and drafting")
 
     def test_agent_add_with_flags_stays_noninteractive(self):

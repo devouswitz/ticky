@@ -11,7 +11,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from ticky_cli.config import AppPaths, ConfigStore, read_env_file, new_config
-from ticky_cli.setup_wizard import parse_provider_selection, run_setup_wizard
+from ticky_cli.setup_wizard import (
+    _choose_providers,
+    _configure_provider_account,
+    parse_provider_selection,
+    run_setup_wizard,
+)
 
 
 def scripted(answers):
@@ -24,6 +29,66 @@ class SetupWizardTests(unittest.TestCase):
             parse_provider_selection("google, xai, local-llm, openai, google"),
             ["gemini", "grok", "ollama", "codex"],
         )
+
+    def test_invalid_interactive_provider_is_reprompted(self):
+        output = io.StringIO()
+        with scripted(["not-a-provider", "codex"]), contextlib.redirect_stdout(output):
+            selected = _choose_providers(None, None)
+
+        self.assertEqual(selected, ["codex"])
+        self.assertIn("unknown provider", output.getvalue())
+
+    def test_duplicate_and_invalid_account_ids_are_reprompted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(AppPaths(Path(temporary)))
+            config = new_config(["claude"])
+            answers = [
+                "",                 # existing-login authentication
+                "",                 # default label
+                "---",              # invalid id
+                "claude-default",   # duplicate id
+                "codex-work",       # accepted id
+                "",                 # do not open login
+            ]
+            output = io.StringIO()
+            with scripted(answers), contextlib.redirect_stdout(output):
+                account_ids = _configure_provider_account(store, config, "codex")
+
+            self.assertEqual(account_ids, ["codex-work"])
+            self.assertIn("codex-work", config["accounts"])
+            self.assertIn("name must contain", output.getvalue())
+            self.assertIn("already exists", output.getvalue())
+
+    def test_existing_provider_can_add_a_second_account(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(AppPaths(Path(temporary)))
+            config = new_config(["codex"])
+            store.save(config)
+            answers = [
+                "",                 # keep codex provider selection
+                "n",                # do not keep account list unchanged
+                "",                 # add a new account
+                "",                 # existing-login authentication
+                "Personal Codex",   # label
+                "personal-codex",   # id
+                "",                 # do not open login
+            ]
+            with (
+                scripted(answers),
+                mock.patch("ticky_cli.setup_wizard._configure_roster"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                run_setup_wizard(store, config)
+
+            saved = store.load()
+            self.assertEqual(
+                set(saved["accounts"]),
+                {"codex-default", "personal-codex"},
+            )
+            self.assertTrue(any(
+                agent["account"] == "personal-codex"
+                for agent in saved["profiles"]["default"]["agents"]
+            ))
 
     def test_gemini_api_key_setup_stores_secret_outside_config(self):
         with tempfile.TemporaryDirectory() as temporary:

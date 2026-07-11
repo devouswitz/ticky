@@ -94,6 +94,13 @@ class PickAgentTests(unittest.TestCase):
         config["profiles"]["default"]["agents"][0]["enabled"] = False
         self.assertEqual(pick_agent(config, "default")["name"], "rook")
 
+    def test_empty_profile_points_to_the_interactive_roster_command(self):
+        config = mock_config(())
+        with self.assertRaises(ConfigError) as raised:
+            pick_agent(config, "default")
+        self.assertIn("/roster", str(raised.exception))
+        self.assertNotIn("ticky roster", str(raised.exception))
+
 
 class SessionContextTests(unittest.TestCase):
     def test_no_history_means_no_context(self):
@@ -171,6 +178,30 @@ class SessionCommandTests(unittest.TestCase):
         agent = self.saved_agent("vale")
         self.assertEqual(agent["model"], "gpt-5.5")
         self.assertEqual(agent["thinking"], "xhigh")
+
+    def test_agents_explains_how_to_fix_an_empty_profile(self):
+        self.session.config["profiles"]["default"]["agents"] = []
+        self.store.save(self.session.config)
+
+        output = self.run_command("/agents")
+
+        self.assertIn("No enabled agents", output)
+        self.assertIn("/roster", output)
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits are not Windows ACLs")
+    def test_interactive_history_is_written_with_private_permissions(self):
+        history = self.paths.root / "history"
+        fake_readline = mock.Mock()
+        fake_readline.write_history_file.side_effect = lambda path: Path(path).write_text(
+            "private task\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch("ticky_cli.session.readline", fake_readline):
+            self.session._save_history(history)
+
+        self.assertEqual(history.stat().st_mode & 0o777, 0o600)
+        fake_readline.set_history_length.assert_called_once_with(500)
 
     def test_model_effort_only_keeps_model(self):
         self.run_command("/model vale high")

@@ -359,7 +359,12 @@ class ConfigBehaviorTests(unittest.TestCase):
             self._initialize(temporary)
 
             named = self._run(
-                temporary, "agent", "add", "finch", "--display", "Finch Helper"
+                temporary,
+                "agent",
+                "add",
+                "fixture-agent",
+                "--display",
+                "Fixture Agent",
             )
             displayed = self._run(
                 temporary, "agent", "add", "--display", "Display Only"
@@ -373,8 +378,8 @@ class ConfigBehaviorTests(unittest.TestCase):
                 agent["name"]: agent
                 for agent in self._load(temporary)["profiles"]["default"]["agents"]
             }
-            self.assertEqual(agents["finch"]["display"], "Finch Helper")
-            self.assertEqual(agents["finch"]["account"], "codex-default")
+            self.assertEqual(agents["fixture-agent"]["display"], "Fixture Agent")
+            self.assertEqual(agents["fixture-agent"]["account"], "codex-default")
             self.assertEqual(agents["display-only"]["display"], "Display Only")
 
     def test_agent_multi_remove_is_atomic(self):

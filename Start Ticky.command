@@ -1,8 +1,12 @@
 #!/bin/zsh
 
 # One-click entry point for the ticky source checkout: runs first-time setup
-# when needed, then drops into the interactive session.
-export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# when needed, checks provider accounts, then opens the interactive session.
+export PATH="$HOME/.local/bin:$HOME/.grok/bin:$HOME/.volta/bin:$HOME/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+setopt NUMERIC_GLOB_SORT
+for node_bin in "$HOME"/.nvm/versions/node/*/bin(N); do
+  export PATH="$node_bin:$PATH"
+done
 ROOT="${0:A:h}"
 CONFIG="${TICKY_HOME:-$HOME/.ticky}/config.json"
 
@@ -13,26 +17,29 @@ elif ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'; th
   printf '\nTicky requires Python 3.11 or newer. The current python3 is too old.\n'
   result=1
 else
-  if [ -t 0 ] && [ -f "$CONFIG" ]; then
-    exec "$ROOT/ticky" ui
+  result=0
+  if [ ! -f "$CONFIG" ]; then
+    printf '\nStarting ticky setup...\n\n'
+    "$ROOT/ticky" setup --no-install --no-link
+    result=$?
+    if [ "$result" -ne 0 ]; then
+      printf '\nTicky setup failed with exit code %s. Review the error above.\n' "$result"
+    fi
   fi
-  printf '\nStarting ticky setup...\n\n'
-  if "$ROOT/ticky" setup; then
+  if [ "$result" -eq 0 ]; then
     printf '\nChecking ticky status...\n\n'
     if "$ROOT/ticky" status && "$ROOT/ticky" account status; then
-      printf '\nTicky is ready. Restart connected Codex or Claude sessions to refresh their agent tools.\n'
+      printf '\nTicky is ready. To connect a harness, run one of:\n'
+      printf '  "%s/ticky" install codex\n' "$ROOT"
+      printf '  "%s/ticky" install claude\n' "$ROOT"
       if [ -t 0 ]; then
         printf '\nDropping into the ticky session...\n\n'
         exec "$ROOT/ticky" ui
       fi
-      result=0
     else
       result=$?
-      printf '\nTicky setup completed, but the status check failed with exit code %s.\n' "$result"
+      printf '\nTicky status check failed with exit code %s. Review the account details above.\n' "$result"
     fi
-  else
-    result=$?
-    printf '\nTicky setup failed with exit code %s. Review the error above.\n' "$result"
   fi
 fi
 
