@@ -1,4 +1,4 @@
-<h1 align="center">ticky</h1>
+<h1 align="center">ticky!</h1>
 
 <p align="center">
   <strong>Turn your AI CLI accounts into named subagents that any MCP-capable harness can call.</strong>
