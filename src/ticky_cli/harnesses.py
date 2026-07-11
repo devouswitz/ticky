@@ -29,12 +29,22 @@ def server_args(profile_name: str | None = None) -> list[str]:
     return arguments
 
 
+def server_command(profile_name: str | None = None, *, platform: str | None = None) -> tuple[str, list[str]]:
+    """Return an MCP command that is directly executable on this platform."""
+    source_wrapper = Path(__file__).resolve().parents[2] / "ticky"
+    arguments = server_args(profile_name)
+    if (platform or os.name) == "nt" and source_wrapper.exists():
+        return sys.executable, [str(source_wrapper), *arguments]
+    return executable_path(), arguments
+
+
 def mcp_json(profile_name: str | None = None) -> dict[str, Any]:
+    command, arguments = server_command(profile_name)
     return {
         "mcpServers": {
             "ticky": {
-                "command": executable_path(),
-                "args": server_args(profile_name),
+                "command": command,
+                "args": arguments,
             }
         }
     }
@@ -141,8 +151,7 @@ def install(target: str, profile_name: str | None = None) -> tuple[bool, str]:
     except OSError as error:
         return False, f"could not back up {target} registration: {error}"
 
-    path = executable_path()
-    arguments = server_args(profile_name)
+    path, arguments = server_command(profile_name)
     if target == "claude":
         try:
             subprocess.run(

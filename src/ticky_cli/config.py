@@ -8,22 +8,58 @@ import random
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 CONFIG_VERSION = 2
-PROVIDERS = ("codex", "claude", "mock")
+PROVIDERS = ("codex", "claude", "gemini", "grok", "ollama", "mock")
+SETUP_PROVIDERS = ("codex", "claude", "gemini", "grok", "ollama")
+PROVIDER_ALIASES = {
+    "anthropic": "claude",
+    "chatgpt": "codex",
+    "google": "gemini",
+    "local": "ollama",
+    "local-llm": "ollama",
+    "openai": "codex",
+    "xai": "grok",
+}
+PROVIDER_EXECUTABLES = {
+    "codex": "codex",
+    "claude": "claude",
+    "gemini": "gemini",
+    "grok": "grok",
+    "ollama": "ollama",
+}
+PROVIDER_KEY_NAMES = {
+    "codex": "OPENAI_API_KEY",
+    "claude": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "grok": "XAI_API_KEY",
+    "ollama": "OLLAMA_API_KEY",
+}
+PROVIDER_LABELS = {
+    "codex": "OpenAI Codex",
+    "claude": "Anthropic Claude Code",
+    "gemini": "Google Gemini CLI",
+    "grok": "xAI Grok",
+    "ollama": "Ollama local or cloud",
+    "mock": "Mock test provider",
+}
 AUTH_MODES = ("inherit", "isolated", "api-key")
 ACCESS_LEVELS = ("read-only", "workspace-write", "full")
 THINKING_LEVELS = ("default", "minimal", "low", "medium", "high", "xhigh", "max")
 FORBIDDEN_EXTRA_OPTIONS = {
-    "-C", "-c", "-m", "-o", "-s",
-    "--add-dir", "--allowed-tools", "--allowedTools", "--cd", "--config",
+    "-C", "-c", "-m", "-o", "-p", "-s", "-y",
+    "--add-dir", "--allow", "--allowed-tools", "--allowedTools", "--always-approve",
+    "--approval-mode", "--cd", "--config", "--cwd",
     "--dangerously-bypass-approvals-and-sandbox", "--dangerously-skip-permissions",
-    "--disallowed-tools", "--disallowedTools", "--effort", "--model",
-    "--output-last-message", "--permission-mode", "--sandbox", "--tools",
+    "--deny", "--disallowed-tools", "--disallowedTools", "--effort", "--model",
+    "--no-subagents", "--output-last-message", "--permission-mode", "--prompt",
+    "--prompt-file", "--prompt-json", "--reasoning-effort", "--sandbox", "--single",
+    "--system-prompt-override", "--think", "--tools", "--yolo",
 }
 NAME_POOL = (
     "Aster", "Briar", "Cinder", "Dove", "Echo", "Finch", "Grove", "Harbor",
@@ -38,6 +74,23 @@ DEFAULT_PREFERENCES = (
 
 class ConfigError(ValueError):
     """Raised when persisted configuration is invalid."""
+
+
+def canonical_provider(value: str) -> str:
+    provider = value.strip().lower()
+    provider = PROVIDER_ALIASES.get(provider, provider)
+    if provider not in PROVIDERS:
+        choices = ", ".join(SETUP_PROVIDERS)
+        raise ConfigError(f"unknown provider {value!r}; choose one of: {choices}")
+    return provider
+
+
+def provider_key_name(provider: str) -> str:
+    canonical = canonical_provider(provider)
+    try:
+        return PROVIDER_KEY_NAMES[canonical]
+    except KeyError as error:
+        raise ConfigError(f"{canonical} does not support API-key accounts") from error
 
 
 def validate_extra_args(values: list[str]) -> None:
@@ -120,6 +173,7 @@ def generated_agent_name(existing: Iterable[str], rng: random.Random | None = No
 
 def account_record(account_id: str, provider: str, label: str | None = None,
                    auth: str = "inherit", home: str | None = None) -> dict[str, Any]:
+    provider = canonical_provider(provider)
     return {
         "id": account_id,
         "label": label or account_id,
@@ -159,7 +213,8 @@ def new_config(providers: Iterable[str] = ("codex", "claude")) -> dict[str, Any]
     accounts: dict[str, dict[str, Any]] = {}
     agents: list[dict[str, Any]] = []
     used: list[str] = []
-    for provider in dict.fromkeys(providers):
+    canonical = [canonical_provider(provider) for provider in providers]
+    for provider in dict.fromkeys(canonical):
         if provider not in PROVIDERS or provider == "mock":
             continue
         account_id = f"{provider}-default"
@@ -250,6 +305,8 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ConfigError(f"account {account_id!r} has unknown provider")
         if account.get("auth", "inherit") not in AUTH_MODES:
             raise ConfigError(f"account {account_id!r} has unknown auth mode")
+        if account.get("auth") == "api-key" and account.get("provider") == "mock":
+            raise ConfigError("mock accounts do not support API-key authentication")
     for profile_name, profile in profiles.items():
         if not isinstance(profile, dict):
             raise ConfigError(f"profile {profile_name!r} must be an object")
@@ -273,6 +330,13 @@ def validate_config(config: dict[str, Any]) -> None:
                 raise ConfigError(f"agent {name!r} has invalid access")
             if agent.get("thinking", "default") not in THINKING_LEVELS:
                 raise ConfigError(f"agent {name!r} has invalid thinking level")
+            model = agent.get("model")
+            if model is not None and (
+                not isinstance(model, str) or not model.strip() or model.startswith("-")
+            ):
+                raise ConfigError(
+                    f"agent {name!r} model must be a plain model name, not {model!r}"
+                )
             try:
                 priority = int(agent.get("priority", 0))
                 timeout = int(agent.get("timeout", 0))
@@ -315,7 +379,7 @@ class ConfigStore:
                 data = json.load(handle)
         except FileNotFoundError:
             if required:
-                raise ConfigError("no config found; run `ticky init` first")
+                raise ConfigError("no config found; run `ticky setup` first")
             return None
         except json.JSONDecodeError as error:
             raise ConfigError(f"invalid config JSON: {error}") from error
@@ -376,6 +440,27 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
+        if os.name == "nt":
+            username = os.environ.get("USERNAME")
+            if not username:
+                raise ConfigError("cannot secure the API-key file because USERNAME is not set")
+            domain = os.environ.get("USERDOMAIN")
+            identity = f"{domain}\\{username}" if domain else username
+            try:
+                secured = subprocess.run(
+                    [
+                        "icacls", temporary, "/inheritance:r", "/grant:r",
+                        f"{identity}:(F)",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise ConfigError(f"could not secure API-key file permissions: {error}") from error
+            if secured.returncode:
+                detail = (secured.stderr or secured.stdout).strip() or "icacls failed"
+                raise ConfigError(f"could not secure API-key file permissions: {detail}")
         os.replace(temporary, path)
     finally:
         try:

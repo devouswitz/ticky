@@ -20,6 +20,8 @@ from . import __version__
 from .config import (
     ACCESS_LEVELS,
     AUTH_MODES,
+    PROVIDER_ALIASES,
+    PROVIDER_EXECUTABLES,
     PROVIDERS,
     THINKING_LEVELS,
     AppPaths,
@@ -28,18 +30,26 @@ from .config import (
     account_record,
     agent as find_agent,
     agent_record,
+    canonical_provider,
     new_config,
     profile as find_profile,
     read_env_file,
     slugify,
-    write_env_file,
 )
+from .credentials import set_api_key, unset_api_key
 from .harnesses import install as install_harness
 from .harnesses import mcp_json_text, uninstall as uninstall_harness
 from .mcp import McpServer, serve as serve_mcp, tool_name
-from .providers import auth_status_command, login_command, run_agent
+from .providers import (
+    api_key_ready,
+    auth_status_command,
+    auth_status_is_linked,
+    login_command,
+    run_agent,
+)
 from .runtime import Activity, format_log_entry, read_log_tail, read_state, render_activity
-from .wizard import ask, ask_bool, prompt_agent, run_roster_wizard
+from .setup_wizard import detected_providers, run_setup_wizard
+from .wizard import ask_bool, prompt_agent, run_roster_wizard
 
 
 def fail(message: str) -> None:
@@ -59,10 +69,49 @@ def _targets(value: str) -> list[str]:
 
 
 def _unique_providers(providers: list[str] | None) -> list[str]:
-    return list(dict.fromkeys(providers or []))
+    return list(dict.fromkeys(canonical_provider(value) for value in (providers or [])))
+
+
+def _merge_provider_defaults(config: dict[str, Any], providers: list[str]) -> bool:
+    """Add noninteractive provider defaults without replacing existing setup."""
+    changed = False
+    _, selected = find_profile(config)
+    names = [agent["name"] for agent in selected["agents"]]
+    for provider in providers:
+        matches = [
+            account_id for account_id, account in config["accounts"].items()
+            if account["provider"] == provider and account.get("enabled", True)
+        ]
+        if matches:
+            account_id = matches[0]
+        else:
+            base = f"{provider}-default"
+            account_id = base
+            suffix = 2
+            while account_id in config["accounts"]:
+                account_id = f"{base}-{suffix}"
+                suffix += 1
+            config["accounts"][account_id] = account_record(
+                account_id,
+                provider,
+                f"Default {provider.title()}",
+                "inherit",
+            )
+            changed = True
+        if not any(agent["account"] == account_id for agent in selected["agents"]):
+            selected["agents"].append(agent_record(
+                account_id,
+                names,
+                specialty=f"General-purpose {provider.title()} CLI subagent.",
+            ))
+            names.append(selected["agents"][-1]["name"])
+            changed = True
+    return changed
 
 
 def _symlink_to_path() -> Path | None:
+    if os.name == "nt":
+        return None
     source = Path(__file__).resolve().parents[2] / "ticky"
     if not source.is_file():
         return None
@@ -93,32 +142,23 @@ def cmd_init(args: argparse.Namespace) -> int:
     existing = store.load(required=False)
     requested = _unique_providers(args.provider)
     interactive = not args.yes and sys.stdin.isatty()
-    if existing is None:
-        selected = requested
-        if not selected:
-            detected = [provider for provider in ("codex", "claude") if shutil.which(provider)]
-            selected = detected or ["codex", "claude"]
-            if interactive:
-                raw = ask("Providers, comma-separated", ",".join(selected))
-                selected = [item.strip().lower() for item in raw.split(",") if item.strip()]
-                unknown = [item for item in selected if item not in ("codex", "claude")]
-                if unknown:
-                    fail(f"unknown providers: {', '.join(unknown)}")
-                selected = _unique_providers(selected)
+    if interactive:
+        result = run_setup_wizard(store, existing, requested or None)
+        config = result.config
+        selected = result.providers
+        print(f"{'created' if existing is None else 'updated'} {store.paths.config}")
+        install_targets = [provider for provider in selected if provider in ("codex", "claude")]
+    elif existing is None:
+        selected = requested or detected_providers() or ["codex", "claude"]
         config = new_config(selected)
-        wizard = interactive and ask_bool(
-            "Build your agent roster interactively now (names, models, access, specialties)?",
-            True,
-        )
-        if wizard:
-            config["profiles"]["default"]["agents"] = []
         store.save(config)
         print(f"created {store.paths.config}")
-        if wizard:
-            run_roster_wizard(store, config, "default")
-        install_targets = selected
+        install_targets = [provider for provider in selected if provider in ("codex", "claude")]
     else:
         config = existing
+        if requested and _merge_provider_defaults(config, requested):
+            store.save(config)
+            print(f"added provider defaults: {', '.join(requested)}")
         print(f"using existing config: {store.paths.config}")
         _, active = find_profile(config)
         if interactive and not active["agents"] and ask_bool(
@@ -129,6 +169,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             account["provider"] for account in config["accounts"].values()
             if account["provider"] in ("codex", "claude")
         ])
+        install_targets = [provider for provider in install_targets if provider in ("codex", "claude")]
     if not args.no_link:
         link = _symlink_to_path()
         if link:
@@ -140,7 +181,13 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"{target}: {'ok' if ok else 'error'}: {message}")
             code = code or (0 if ok else 1)
     print(f"active profile: {config['active_profile']}")
-    print("Next: `ticky account status`, `ticky roster`, `ticky agent list`, or `ticky watch`.")
+    if not interactive and any(
+        config["accounts"][agent["account"]]["provider"] == "ollama"
+        and not agent.get("model")
+        for agent in config["profiles"][config["active_profile"]]["agents"]
+    ):
+        print("Ollama agents still need an installed model; set one with `/model` or `ticky agent edit`.")
+    print("Next: `ticky`, `/setup`, `ticky account status`, or `ticky agent list`.")
     print("Restart connected harnesses after changing profiles or agent tools.")
     return code
 
@@ -149,10 +196,16 @@ def cmd_account_list(args: argparse.Namespace) -> int:
     config = _store().load()
     for account_id, account in sorted(config["accounts"].items()):
         state = "on" if account.get("enabled", True) else "off"
-        isolated = account.get("home") or "managed by ticky" if account.get("auth") == "isolated" else "shared CLI auth"
+        auth = account.get("auth", "inherit")
+        if auth == "isolated":
+            location = account.get("home") or "managed by ticky"
+        elif auth == "api-key":
+            location = "private account key file"
+        else:
+            location = "shared CLI auth"
         print(
-            f"[{state}] {account_id}: {account['provider']} {account.get('auth', 'inherit')} "
-            f"({account.get('label') or account_id}; {isolated})"
+            f"[{state}] {account_id}: {account['provider']} {auth} "
+            f"({account.get('label') or account_id}; {location})"
         )
     if not config["accounts"]:
         print("No accounts. Add one with `ticky account add`.")
@@ -164,9 +217,12 @@ def cmd_account_add(args: argparse.Namespace) -> int:
     config = store.load()
     provider = args.provider
     if provider is None and sys.stdin.isatty():
-        provider = input("Provider (codex/claude): ").strip().lower()
-    if provider not in ("codex", "claude"):
-        fail("account provider must be codex or claude")
+        provider = input(
+            "Provider (codex/claude/gemini/grok/ollama): "
+        ).strip().lower()
+    if provider is None:
+        fail("--provider is required outside an interactive terminal")
+    provider = canonical_provider(provider)
     label = args.label or f"{provider.title()} account"
     base = slugify(args.id or label)
     account_id = base
@@ -176,10 +232,12 @@ def cmd_account_add(args: argparse.Namespace) -> int:
             fail(f"account {account_id!r} already exists")
         account_id = f"{base}-{suffix}"
         suffix += 1
-    auth = args.auth or "isolated"
+    auth = args.auth or ("inherit" if provider == "ollama" else "isolated")
     config["accounts"][account_id] = account_record(account_id, provider, label, auth, args.home)
     store.save(config)
     print(f"added account {account_id} ({provider}, {auth})")
+    if provider == "mock":
+        return 0
     if args.login:
         return _account_login(config["accounts"][account_id], store.paths)
     print(f"Link credentials with `ticky account login {account_id}` or `ticky account key set {account_id}`.")
@@ -217,6 +275,32 @@ def cmd_account_status(args: argparse.Namespace) -> int:
     code = 0
     for account_id in account_ids:
         account = config["accounts"][account_id]
+        executable = PROVIDER_EXECUTABLES.get(account["provider"])
+        if account.get("auth") == "api-key":
+            ready, summary = api_key_ready(store.paths, account)
+            if (
+                ready and executable and account["provider"] != "ollama"
+                and not shutil.which(executable)
+            ):
+                ready = False
+                summary = f"{summary}; {executable} CLI not found"
+            if not ready:
+                print(f"{account_id}: not configured: {summary}")
+                code = 1
+                continue
+            if account["provider"] in ("claude", "gemini", "ollama"):
+                print(f"{account_id}: configured: {summary}; validity is checked on first call")
+                continue
+        elif executable and not shutil.which(executable):
+            print(f"{account_id}: not linked: {executable} CLI not found")
+            code = 1
+            continue
+        elif account["provider"] == "gemini" and account.get("auth") == "inherit":
+            print(
+                f"{account_id}: configured: Gemini CLI found; its shared OS-keychain "
+                "login is verified on the first agent call"
+            )
+            continue
         try:
             command, env = auth_status_command(store.paths, account)
             result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
@@ -234,7 +318,7 @@ def cmd_account_status(args: argparse.Namespace) -> int:
                     ) or "status returned"
                 else:
                     summary = raw_detail.splitlines()[0] if raw_detail else "no status detail"
-            ok = result.returncode == 0
+            ok = auth_status_is_linked(account["provider"], result.returncode, raw_detail)
         except (OSError, subprocess.TimeoutExpired) as error:
             ok = False
             summary = str(error)
@@ -274,7 +358,6 @@ def cmd_account_key(args: argparse.Namespace) -> int:
         account = config["accounts"][account_id]
     except KeyError as error:
         raise ConfigError(f"no account named {account_id!r}") from error
-    default_key = "OPENAI_API_KEY" if account["provider"] == "codex" else "ANTHROPIC_API_KEY"
     path = store.paths.account_env(account_id)
     values = read_env_file(path)
     if args.key_action == "list":
@@ -283,22 +366,16 @@ def cmd_account_key(args: argparse.Namespace) -> int:
         if not values:
             print("No keys stored.")
         return 0
-    key = args.name or default_key
     if args.key_action == "unset":
-        values.pop(key, None)
-        write_env_file(path, values)
+        key = unset_api_key(store.paths, account, args.name)
         print(f"removed {key} from {account_id}")
         return 0
-    value = getpass.getpass(f"Value for {key}: ").strip()
-    if not value:
-        fail("empty key was not saved")
-    values[key] = value
-    write_env_file(path, values)
-    if account.get("auth") != "api-key":
-        account["auth"] = "api-key"
-        store.save(config)
-    print(f"saved {key} for {account_id} in a 0600 file")
-    return 0
+    label = args.name or "provider API key"
+    value = getpass.getpass(f"Value for {label}: ").strip()
+    ok, message = set_api_key(store.paths, account, value, args.name)
+    store.save(config)
+    print(f"{account_id}: {'ready' if ok else 'needs attention'}: {message}")
+    return 0 if ok else 1
 
 
 def cmd_profile_list(args: argparse.Namespace) -> int:
@@ -593,6 +670,11 @@ def cmd_call(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def cmd_ui(args: argparse.Namespace) -> int:
+    from .session import run_session
+    return run_session()
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     serve_mcp(args.profile, args.config_override)
     return 0
@@ -676,15 +758,23 @@ def cmd_status(args: argparse.Namespace) -> int:
     config = store.load(required=False)
     print(f"ticky {__version__}  home={store.paths.root}")
     if config is None:
-        print("config: missing; run `ticky init`")
+        print("config: missing; run `ticky setup`")
         return 1
     print(f"active profile: {config['active_profile']}")
     print(f"accounts: {len(config['accounts'])}; profiles: {len(config['profiles'])}")
     for account_id, account in sorted(config["accounts"].items()):
-        installed = bool(shutil.which(account["provider"])) if account["provider"] != "mock" else True
+        executable = PROVIDER_EXECUTABLES.get(account["provider"])
+        required = not (
+            account["provider"] == "mock"
+            or (account["provider"] == "ollama" and account.get("auth") == "api-key")
+        )
+        installed = bool(shutil.which(executable)) if executable and required else True
+        cli_status = "found" if installed else "missing"
+        if not required:
+            cli_status = "not required"
         print(
             f"  account {account_id}: {account['provider']} auth={account.get('auth', 'inherit')} "
-            f"cli={'found' if installed else 'missing'}"
+            f"cli={cli_status}"
         )
     _, selected = find_profile(config)
     print(f"agents in active profile: {len(selected['agents'])}")
@@ -740,10 +830,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"ticky {__version__}")
     commands = parser.add_subparsers(dest="command")
 
-    init = commands.add_parser("init", aliases=["setup"], help="initialize config and harness registrations")
+    init = commands.add_parser(
+        "setup", aliases=["init"],
+        help="guided accounts, API keys, models, taglines, and harness setup",
+    )
     init.add_argument("--yes", "-y", action="store_true", help="accept detected providers without prompts")
     init.add_argument(
-        "--provider", action="append", choices=("codex", "claude"),
+        "--provider", action="append",
+        choices=tuple(PROVIDER_EXECUTABLES) + tuple(PROVIDER_ALIASES),
         help="provider to configure or register (repeatable)",
     )
     init.add_argument("--no-install", action="store_true", help="do not register MCP with known harnesses")
@@ -757,8 +851,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = account_commands.add_parser("add")
     sub.add_argument("--id")
     sub.add_argument("--label")
-    sub.add_argument("--provider", choices=("codex", "claude"))
-    sub.add_argument("--auth", choices=AUTH_MODES, default="isolated")
+    sub.add_argument("--provider", choices=PROVIDERS + tuple(PROVIDER_ALIASES))
+    sub.add_argument("--auth", choices=AUTH_MODES)
     sub.add_argument("--home")
     sub.add_argument("--login", action="store_true")
     sub.set_defaults(handler=cmd_account_add)
@@ -837,6 +931,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_profile_option(roster)
     roster.set_defaults(handler=cmd_roster)
 
+    ui = commands.add_parser(
+        "ui", aliases=["chat", "session"],
+        help="interactive session: dispatch agents, watch activity, no window juggling",
+    )
+    ui.set_defaults(handler=cmd_ui)
+
     call = commands.add_parser("call", help="invoke one agent from the terminal")
     call.add_argument("agent")
     call.add_argument("task")
@@ -887,7 +987,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):
-        args = parser.parse_args(["status"])
+        interactive = sys.stdin.isatty() and sys.stdout.isatty()
+        args = parser.parse_args(["ui" if interactive else "status"])
     try:
         return int(args.handler(args) or 0)
     except ConfigError as error:

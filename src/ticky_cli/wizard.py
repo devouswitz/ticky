@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+import textwrap
 from typing import Any, Sequence
 
 from .config import (
@@ -24,6 +26,9 @@ ACCESS_HELP = {
 MODEL_HINTS = {
     "codex": "blank = provider default; examples: gpt-5.5, gpt-5.5-codex",
     "claude": "blank = provider default; examples: sonnet, opus, haiku",
+    "gemini": "blank = provider default; examples: gemini-3-pro, gemini-3-flash",
+    "grok": "blank = provider default; examples: grok-build, grok-composer-2.5-fast",
+    "ollama": "required; examples: gpt-oss:20b, llama3.3, gpt-oss:120b-cloud",
     "mock": "blank = provider default",
 }
 ROSTER_ACTIONS = ("add", "edit", "remove", "preferences", "done")
@@ -146,11 +151,15 @@ def prompt_agent(config: dict[str, Any], existing: Sequence[str],
         break
     record["account"] = choose_account(config, record.get("account") or None)
     provider = config["accounts"][record["account"]]["provider"]
-    record["model"] = ask(
-        f"Model ({MODEL_HINTS.get(provider, 'blank = provider default')})",
-        record.get("model") or "",
-        clearable=True,
-    ) or None
+    while True:
+        record["model"] = ask(
+            f"Model ({MODEL_HINTS.get(provider, 'blank = provider default')})",
+            record.get("model") or "",
+            clearable=True,
+        ) or None
+        if provider != "ollama" or record["model"]:
+            break
+        print("Ollama agents need a model name, for example gpt-oss:20b or llama3.3.")
     record["thinking"] = ask_choice(
         "Thinking effort", THINKING_LEVELS, record.get("thinking") or "default",
     )
@@ -177,6 +186,15 @@ def prompt_agent(config: dict[str, Any], existing: Sequence[str],
     return record
 
 
+def _print_wrapped(text: str, indent: str) -> None:
+    width = shutil.get_terminal_size((80, 24)).columns
+    for line in textwrap.wrap(
+        text, width=max(width, 30), initial_indent=indent, subsequent_indent=indent + "  ",
+        break_long_words=True, break_on_hyphens=False,
+    ) or [indent + text]:
+        print(line)
+
+
 def _print_roster(config: dict[str, Any], selected: dict[str, Any]) -> None:
     print()
     if not selected["agents"]:
@@ -185,15 +203,16 @@ def _print_roster(config: dict[str, Any], selected: dict[str, Any]) -> None:
         account = config["accounts"][agent["account"]]
         model = agent.get("model") or "default"
         network = " network=on" if agent.get("network") else ""
-        print(
-            f"  {agent['display']} ({tool_name(agent)}): p{agent['priority']} "
+        _print_wrapped(
+            f"{agent['display']} ({tool_name(agent)}): p{agent['priority']} "
             f"{account['provider']}/{agent['account']} model={model} "
-            f"thinking={agent.get('thinking', 'default')} {agent['access']}{network}"
+            f"thinking={agent.get('thinking', 'default')} {agent['access']}{network}",
+            "  ",
         )
         if agent.get("specialty"):
-            print(f"      {agent['specialty']}")
+            _print_wrapped(agent["specialty"], "      ")
         if agent.get("routing_note"):
-            print(f"      note: {agent['routing_note']}")
+            _print_wrapped(f"note: {agent['routing_note']}", "      ")
     print()
 
 

@@ -7,6 +7,7 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,8 +21,26 @@ from ticky_cli.config import (
     agent_record,
     generated_agent_name,
     new_config,
+    validate_config,
+    write_env_file,
 )
-from ticky_cli.cli import _selected_account, _symlink_to_path, cmd_init
+from ticky_cli.cli import _selected_account, _symlink_to_path, cmd_account_status, cmd_init
+
+
+class ModelValidationTests(unittest.TestCase):
+    def _config_with_model(self, model):
+        config = new_config(["codex"])
+        config["profiles"]["default"]["agents"][0]["model"] = model
+        return config
+
+    def test_plain_model_names_are_accepted(self):
+        for model in (None, "gpt-5.5", "opus"):
+            validate_config(self._config_with_model(model))
+
+    def test_flag_shaped_and_empty_models_are_rejected(self):
+        for model in ("--dangerously-skip-permissions", "-o", "", "   ", 7):
+            with self.assertRaises(ConfigError):
+                validate_config(self._config_with_model(model))
 
 
 class ConfigBehaviorTests(unittest.TestCase):
@@ -53,6 +72,63 @@ class ConfigBehaviorTests(unittest.TestCase):
         result = self._run(temporary, *arguments)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
+
+    def test_shared_gemini_status_is_explicit_about_deferred_login_verification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(AppPaths(Path(temporary)))
+            store.save(new_config(["gemini"]))
+            output = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"TICKY_HOME": temporary}),
+                mock.patch("ticky_cli.cli.shutil.which", return_value="/fake/gemini"),
+                redirect_stdout(output),
+            ):
+                code = cmd_account_status(SimpleNamespace(account=None))
+            self.assertEqual(code, 0)
+            self.assertIn("configured", output.getvalue())
+            self.assertIn("verified on the first agent call", output.getvalue())
+
+    def test_api_key_status_distinguishes_configuration_from_live_validity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(AppPaths(Path(temporary)))
+            config = new_config(["gemini"])
+            config["accounts"]["gemini-default"]["auth"] = "api-key"
+            store.save(config)
+            write_env_file(
+                store.paths.account_env("gemini-default"),
+                {"GEMINI_API_KEY": "test-secret"},
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"TICKY_HOME": temporary}),
+                mock.patch("ticky_cli.cli.shutil.which", return_value="/fake/gemini"),
+                redirect_stdout(output),
+            ):
+                code = cmd_account_status(SimpleNamespace(account=None))
+            self.assertEqual(code, 0)
+            self.assertIn("configured", output.getvalue())
+            self.assertIn("validity is checked on first call", output.getvalue())
+
+    def test_noninteractive_setup_adds_requested_provider_to_existing_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self._initialize(temporary, "codex")
+            added = self._run(
+                temporary,
+                "setup", "--yes", "--provider", "google", "--no-install", "--no-link",
+            )
+            repeated = self._run(
+                temporary,
+                "setup", "--yes", "--provider", "google", "--no-install", "--no-link",
+            )
+            self.assertEqual(added.returncode, 0, added.stderr)
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            saved = self._load(temporary)
+            self.assertIn("gemini-default", saved["accounts"])
+            gemini_agents = [
+                agent for agent in saved["profiles"]["default"]["agents"]
+                if agent["account"] == "gemini-default"
+            ]
+            self.assertEqual(len(gemini_agents), 1)
 
     def test_v1_migration_preserves_roster_and_creates_backup(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -177,6 +253,7 @@ class ConfigBehaviorTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("codex: error: registration failed", output.getvalue())
 
+    @unittest.skipIf(os.name == "nt", "source checkout symlinks are POSIX-only")
     def test_init_link_is_idempotent_and_preserves_conflict(self):
         with tempfile.TemporaryDirectory() as temporary:
             arguments = (
@@ -209,6 +286,7 @@ class ConfigBehaviorTests(unittest.TestCase):
             self.assertTrue(destination.is_symlink())
             self.assertEqual(destination.resolve(), other.resolve())
 
+    @unittest.skipIf(os.name == "nt", "source checkout symlinks are POSIX-only")
     def test_init_link_errors_are_clean(self):
         with tempfile.TemporaryDirectory() as temporary:
             environment = self._environment(temporary)
