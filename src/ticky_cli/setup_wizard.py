@@ -24,7 +24,7 @@ from .config import (
 )
 from .credentials import set_api_key
 from .providers import login_command
-from .wizard import ask, ask_bool, ask_choice, prompt_agent
+from .wizard import MODEL_HINTS, ask, ask_bool, ask_choice, prompt_agent
 
 AUTH_CHOICES = ("existing-login", "separate-login", "api-key")
 AUTH_HELP = {
@@ -124,7 +124,7 @@ def _run_login(store: ConfigStore, account: dict[str, Any]) -> None:
 
 
 def _configure_provider_account(store: ConfigStore, config: dict[str, Any],
-                                provider: str) -> list[str]:
+                                provider: str, *, quick: bool = False) -> list[str]:
     existing = [
         account for account in config["accounts"].values()
         if account["provider"] == provider and account.get("enabled", True)
@@ -181,20 +181,26 @@ def _configure_provider_account(store: ConfigStore, config: dict[str, Any],
     if account is not None:
         account["auth"] = auth
         account_id = account["id"]
-        account["label"] = ask("Account label", account.get("label") or account_id)
+        if not quick:
+            account["label"] = ask("Account label", account.get("label") or account_id)
     else:
-        label = ask("Account label", f"{PROVIDER_LABELS[provider]} account")
-        while True:
-            raw_id = ask("Account id", _unused_account_id(config, default_id))
-            try:
-                account_id = slugify(raw_id)
-            except ConfigError as error:
-                print(error)
-                continue
-            if account_id in config["accounts"]:
-                print(f"account {account_id!r} already exists; choose another id")
-                continue
-            break
+        if quick:
+            label = f"{PROVIDER_LABELS[provider]} account"
+            account_id = _unused_account_id(config, default_id)
+            print(f"  Using account {account_id} with safe defaults.")
+        else:
+            label = ask("Account label", f"{PROVIDER_LABELS[provider]} account")
+            while True:
+                raw_id = ask("Account id", _unused_account_id(config, default_id))
+                try:
+                    account_id = slugify(raw_id)
+                except ConfigError as error:
+                    print(error)
+                    continue
+                if account_id in config["accounts"]:
+                    print(f"account {account_id!r} already exists; choose another id")
+                    continue
+                break
         account = account_record(account_id, provider, label, auth)
         config["accounts"][account_id] = account
 
@@ -210,7 +216,9 @@ def _configure_provider_account(store: ConfigStore, config: dict[str, Any],
             "Sign into Ollama Cloud now" if provider == "ollama"
             else "Open the subscription login now"
         )
-        if ask_bool(label, default_login):
+        if quick and auth == "isolated":
+            _run_login(store, account)
+        elif not quick and ask_bool(label, default_login):
             _run_login(store, account)
     return [account_id]
 
@@ -232,9 +240,28 @@ def _seed_missing_agents(config: dict[str, Any], account_ids: Iterable[str]) -> 
         selected["agents"].append(agent)
 
 
-def _configure_roster(store: ConfigStore, config: dict[str, Any], *, first_time: bool) -> None:
+def _configure_roster(store: ConfigStore, config: dict[str, Any], *, first_time: bool,
+                      quick: bool = False) -> None:
     selected = config["profiles"][config["active_profile"]]
     print("\nAgents, models, and taglines")
+    if quick:
+        for record in selected["agents"]:
+            provider = config["accounts"][record["account"]]["provider"]
+            if provider != "ollama" or record.get("model"):
+                continue
+            while True:
+                model = ask(f"Model for {record['display']} ({MODEL_HINTS['ollama']})")
+                if model and not model.startswith("-"):
+                    record["model"] = model
+                    break
+                print("Enter an installed local model or an Ollama Cloud model name.")
+        store.save(config)
+        print(
+            f"  Ready with {len(selected['agents'])} generated, read-only "
+            "agent(s) using safe defaults."
+        )
+        print("  Customize later with `/roster`, `/model`, or `/setup`.")
+        return
     review = first_time or ask_bool(
         "Review each agent's account, model, access, tagline, and routing note", True,
     )
@@ -256,20 +283,30 @@ def _configure_roster(store: ConfigStore, config: dict[str, Any], *, first_time:
 
 
 def run_setup_wizard(store: ConfigStore, config: dict[str, Any] | None = None,
-                     requested: Iterable[str] | None = None) -> SetupResult:
+                     requested: Iterable[str] | None = None,
+                     *, quick: bool | None = None) -> SetupResult:
     """Run the full guided setup and persist completed phases safely."""
     first_time = config is None
     working = copy.deepcopy(config) if config is not None else new_config([])
     print("Ticky setup")
     print("Press Return to accept a value in brackets. Secrets are entered with hidden input.")
     providers = _choose_providers(working if not first_time else None, requested)
+    if quick is None:
+        quick = first_time and not ask_bool(
+            "Customize account names and every agent setting now", False,
+        )
+    if quick:
+        print(
+            "\nQuick setup keeps account names automatic and agents read-only. "
+            "Models and other details can be changed later."
+        )
     account_ids: list[str] = []
     for provider in providers:
-        account_ids.extend(_configure_provider_account(store, working, provider))
+        account_ids.extend(_configure_provider_account(store, working, provider, quick=quick))
     if not account_ids:
         raise ConfigError("setup did not leave any enabled accounts")
     _seed_missing_agents(working, account_ids)
     store.save(working)
-    _configure_roster(store, working, first_time=first_time)
-    print("\nSetup saved. Run `/status` or `ticky account status` to check connections.")
+    _configure_roster(store, working, first_time=first_time, quick=quick)
+    print("\nSetup saved. Check connections anytime with `ticky account status`.")
     return SetupResult(working, providers)

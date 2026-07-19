@@ -1,9 +1,9 @@
 """Interactive terminal session: a Claude Code-style front end for the roster.
 
-Run with `ticky ui` (or bare `ticky` in a terminal). Type a task to dispatch
-it to the best-fitting agent, `@name task` to target one, or `/help` for
-commands. Live activity from connected harnesses shows up between prompts, so
-there is no need for a separate `ticky watch` window.
+Run with bare `ticky`, `ticky start`, or `ticky ui`. Type a task to dispatch it
+to the best-fitting agent, `@name task` to target one, or `/help` for commands.
+Live activity from connected harnesses shows up between prompts, so there is no
+need for a separate `ticky watch` window.
 """
 
 from __future__ import annotations

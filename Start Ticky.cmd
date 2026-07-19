@@ -25,52 +25,15 @@ if errorlevel 1 (
   goto finish
 )
 
-if defined TICKY_HOME (
-  set "TICKY_CONFIG=%TICKY_HOME%\config.json"
-) else (
-  set "TICKY_CONFIG=%USERPROFILE%\.ticky\config.json"
-)
-
-if exist "%TICKY_CONFIG%" goto check_status
-
 echo.
-echo Starting Ticky setup...
+echo Starting Ticky...
 echo.
-%PYTHON% "%~dp0ticky" setup --no-install --no-link
-if errorlevel 1 goto setup_failed
-
-:check_status
-echo.
-echo Checking Ticky status...
-echo.
-%PYTHON% "%~dp0ticky" status
-if errorlevel 1 (
-  set "RESULT=%ERRORLEVEL%"
-  echo.
-  echo Ticky status needs attention.
-  goto finish
-)
-%PYTHON% "%~dp0ticky" account status
-if errorlevel 1 (
-  set "RESULT=%ERRORLEVEL%"
-  echo.
-  echo One or more provider connections need attention.
-  goto finish
-)
-
-echo.
-echo Ticky is ready. To connect a harness, run one of:
-echo   %PYTHON% "%~dp0ticky" install codex
-echo   %PYTHON% "%~dp0ticky" install claude
-echo.
-%PYTHON% "%~dp0ticky" ui
+%PYTHON% "%~dp0ticky" start
 set "RESULT=%ERRORLEVEL%"
-goto finish
-
-:setup_failed
-set "RESULT=%ERRORLEVEL%"
-echo.
-echo Ticky setup did not finish successfully.
+if not "%RESULT%"=="0" (
+  echo.
+  echo Ticky could not start. Review the message above.
+)
 
 :finish
 echo.

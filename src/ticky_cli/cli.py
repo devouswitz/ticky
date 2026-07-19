@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -143,7 +144,12 @@ def cmd_init(args: argparse.Namespace) -> int:
     requested = _unique_providers(args.provider)
     interactive = not args.yes and sys.stdin.isatty()
     if interactive:
-        result = run_setup_wizard(store, existing, requested or None)
+        quick: bool | None = None
+        if getattr(args, "quick", False):
+            quick = True
+        elif getattr(args, "customize", False):
+            quick = False
+        result = run_setup_wizard(store, existing, requested or None, quick=quick)
         config = result.config
         selected = result.providers
         print(f"{'created' if existing is None else 'updated'} {store.paths.config}")
@@ -187,7 +193,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         for agent in config["profiles"][config["active_profile"]]["agents"]
     ):
         print("Ollama agents still need an installed model; set one with `/model` or `ticky agent edit`.")
-    print("Next: `ticky`, `/setup`, `ticky account status`, or `ticky agent list`.")
+    if getattr(args, "start_after_setup", False):
+        print("Opening Ticky. Customize later with `/setup` or `/roster`.")
+    else:
+        print("Start Ticky with `ticky`. Customize later with `/setup` or `/roster`.")
     if args.no_install:
         print("Harness registration was skipped. Run `ticky install codex` or `ticky install claude` when ready.")
     else:
@@ -265,6 +274,56 @@ def cmd_account_login(args: argparse.Namespace) -> int:
     return _account_login(account, store.paths)
 
 
+def _account_status_line(paths: AppPaths, account_id: str,
+                         account: dict[str, Any]) -> tuple[bool, str]:
+    executable = PROVIDER_EXECUTABLES.get(account["provider"])
+    if account["provider"] == "mock":
+        return True, f"{account_id}: configured: built-in test provider"
+    if account.get("auth") == "api-key":
+        ready, summary = api_key_ready(paths, account)
+        if (
+            ready and executable and account["provider"] != "ollama"
+            and not shutil.which(executable)
+        ):
+            ready = False
+            summary = f"{summary}; {executable} CLI not found"
+        if not ready:
+            return False, f"{account_id}: not configured: {summary}"
+        if account["provider"] in ("claude", "gemini", "ollama"):
+            return True, (
+                f"{account_id}: configured: {summary}; validity is checked on first call"
+            )
+    elif executable and not shutil.which(executable):
+        return False, f"{account_id}: not linked: {executable} CLI not found"
+    elif account["provider"] == "gemini" and account.get("auth") == "inherit":
+        return True, (
+            f"{account_id}: configured: Gemini CLI found; its shared OS-keychain "
+            "login is verified on the first agent call"
+        )
+    try:
+        command, env = auth_status_command(paths, account)
+        result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
+        raw_detail = (result.stdout or result.stderr).strip()
+        try:
+            parsed_detail = json.loads(raw_detail)
+        except json.JSONDecodeError:
+            detail_lines = raw_detail.splitlines()
+            summary = detail_lines[0] if detail_lines else "no status detail"
+        else:
+            if isinstance(parsed_detail, dict):
+                visible_fields = ("loggedIn", "authMethod", "apiProvider", "subscriptionType")
+                summary = ", ".join(
+                    f"{key}={parsed_detail[key]}" for key in visible_fields if key in parsed_detail
+                ) or "status returned"
+            else:
+                summary = raw_detail.splitlines()[0] if raw_detail else "no status detail"
+        ok = auth_status_is_linked(account["provider"], result.returncode, raw_detail)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        ok = False
+        summary = str(error)
+    return ok, f"{account_id}: {'linked' if ok else 'not linked'}: {summary}"
+
+
 def cmd_account_status(args: argparse.Namespace) -> int:
     store = _store()
     config = store.load()
@@ -275,60 +334,22 @@ def cmd_account_status(args: argparse.Namespace) -> int:
         account_ids = [account_id]
     else:
         account_ids = sorted(config["accounts"])
-    code = 0
-    for account_id in account_ids:
-        account = config["accounts"][account_id]
-        executable = PROVIDER_EXECUTABLES.get(account["provider"])
-        if account.get("auth") == "api-key":
-            ready, summary = api_key_ready(store.paths, account)
-            if (
-                ready and executable and account["provider"] != "ollama"
-                and not shutil.which(executable)
-            ):
-                ready = False
-                summary = f"{summary}; {executable} CLI not found"
-            if not ready:
-                print(f"{account_id}: not configured: {summary}")
-                code = 1
-                continue
-            if account["provider"] in ("claude", "gemini", "ollama"):
-                print(f"{account_id}: configured: {summary}; validity is checked on first call")
-                continue
-        elif executable and not shutil.which(executable):
-            print(f"{account_id}: not linked: {executable} CLI not found")
-            code = 1
-            continue
-        elif account["provider"] == "gemini" and account.get("auth") == "inherit":
-            print(
-                f"{account_id}: configured: Gemini CLI found; its shared OS-keychain "
-                "login is verified on the first agent call"
-            )
-            continue
-        try:
-            command, env = auth_status_command(store.paths, account)
-            result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
-            raw_detail = (result.stdout or result.stderr).strip()
-            try:
-                parsed_detail = json.loads(raw_detail)
-            except json.JSONDecodeError:
-                detail_lines = raw_detail.splitlines()
-                summary = detail_lines[0] if detail_lines else "no status detail"
-            else:
-                if isinstance(parsed_detail, dict):
-                    visible_fields = ("loggedIn", "authMethod", "apiProvider", "subscriptionType")
-                    summary = ", ".join(
-                        f"{key}={parsed_detail[key]}" for key in visible_fields if key in parsed_detail
-                    ) or "status returned"
-                else:
-                    summary = raw_detail.splitlines()[0] if raw_detail else "no status detail"
-            ok = auth_status_is_linked(account["provider"], result.returncode, raw_detail)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            ok = False
-            summary = str(error)
-        print(f"{account_id}: {'linked' if ok else 'not linked'}: {summary}")
-        if not ok:
-            code = 1
-    return code
+    if not account_ids:
+        print("No accounts configured. Run `ticky setup`.")
+        return 1
+
+    def check(account_id: str) -> tuple[bool, str]:
+        return _account_status_line(store.paths, account_id, config["accounts"][account_id])
+
+    if len(account_ids) == 1:
+        results = [check(account_ids[0])]
+    else:
+        workers = min(len(account_ids), 5)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ticky-status") as pool:
+            results = list(pool.map(check, account_ids))
+    for _, line in results:
+        print(line)
+    return 0 if all(ok for ok, _ in results) else 1
 
 
 
@@ -678,6 +699,79 @@ def cmd_ui(args: argparse.Namespace) -> int:
     return run_session()
 
 
+def _startup_warnings(config: dict[str, Any], paths: AppPaths) -> list[str]:
+    """Return fast, local readiness warnings without running provider commands."""
+    profile_name, selected = find_profile(config)
+    agents = [agent for agent in selected["agents"] if agent.get("enabled", True)]
+    if not agents:
+        return [f"profile {profile_name!r} has no enabled agents; use `/roster` to add one"]
+
+    warnings: list[str] = []
+    checked_accounts: set[str] = set()
+    for agent in agents:
+        account_id = agent["account"]
+        account = config["accounts"][account_id]
+        if not account.get("enabled", True):
+            warnings.append(
+                f"{agent['display']} uses disabled account {account_id}; "
+                "edit the roster or account"
+            )
+            continue
+        if account_id not in checked_accounts:
+            checked_accounts.add(account_id)
+            provider = account["provider"]
+            executable = PROVIDER_EXECUTABLES.get(provider)
+            if account.get("auth") == "api-key":
+                ready, summary = api_key_ready(paths, account)
+                if not ready:
+                    warnings.append(f"{account_id}: {summary}")
+            cli_required = not (
+                provider == "mock"
+                or (provider == "ollama" and account.get("auth") == "api-key")
+            )
+            if cli_required and executable and not shutil.which(executable):
+                warnings.append(f"{account_id}: {executable} CLI was not found")
+        if account["provider"] == "ollama" and not agent.get("model"):
+            warnings.append(
+                f"{agent['display']}: choose an Ollama model with `/model {agent['name']}`"
+            )
+    return warnings
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    """Set up Ticky when needed, check local readiness, and open the session."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        fail("`ticky start` needs an interactive terminal; use `ticky status` in scripts")
+    store = _store()
+    config = store.load(required=False)
+    if config is None:
+        print("Welcome to Ticky. Let's get safe agents ready.")
+        setup_args = argparse.Namespace(
+            provider=None,
+            yes=False,
+            no_install=True,
+            no_link=True,
+            quick=getattr(args, "quick", False),
+            customize=getattr(args, "customize", False),
+            start_after_setup=True,
+        )
+        code = cmd_init(setup_args)
+        if code:
+            return code
+        config = store.load()
+
+    warnings = _startup_warnings(config, store.paths)
+    if warnings:
+        print("\nTicky is opening with startup notes:")
+        for warning in warnings:
+            print(f"  - {warning}")
+        print(
+            "Fix them with `/setup` or `/roster`; run `ticky account status` "
+            "for live login checks."
+        )
+    return cmd_ui(args)
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     serve_mcp(args.profile, args.config_override)
     return 0
@@ -833,9 +927,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"ticky {__version__}")
     commands = parser.add_subparsers(dest="command")
 
+    start = commands.add_parser(
+        "start",
+        help="set up when needed, check local readiness, and open the interactive session",
+    )
+    start_mode = start.add_mutually_exclusive_group()
+    start_mode.add_argument(
+        "--quick", action="store_true",
+        help="use safe generated defaults during first-time setup",
+    )
+    start_mode.add_argument(
+        "--customize", action="store_true",
+        help="review every account and agent setting during first-time setup",
+    )
+    start.set_defaults(handler=cmd_start)
+
     init = commands.add_parser(
         "setup", aliases=["init"],
-        help="guided accounts, API keys, models, taglines, and harness setup",
+        help="configure accounts and agents with quick or fully customized setup",
     )
     init.add_argument("--yes", "-y", action="store_true", help="accept detected providers without prompts")
     init.add_argument(
@@ -845,6 +954,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument("--no-install", action="store_true", help="do not register MCP with known harnesses")
     init.add_argument("--no-link", action="store_true", help="do not link ticky into ~/.local/bin")
+    setup_mode = init.add_mutually_exclusive_group()
+    setup_mode.add_argument(
+        "--quick", action="store_true",
+        help="use generated account names and safe agent defaults",
+    )
+    setup_mode.add_argument(
+        "--customize", action="store_true",
+        help="review every account and agent setting",
+    )
     init.set_defaults(handler=cmd_init)
 
     account = commands.add_parser("account", help="manage provider credential accounts")
@@ -991,7 +1109,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):
         interactive = sys.stdin.isatty() and sys.stdout.isatty()
-        args = parser.parse_args(["ui" if interactive else "status"])
+        args = parser.parse_args(["start" if interactive else "status"])
     try:
         return int(args.handler(args) or 0)
     except ConfigError as error:

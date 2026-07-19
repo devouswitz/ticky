@@ -115,7 +115,7 @@ class SetupWizardTests(unittest.TestCase):
                 mock.patch("ticky_cli.setup_wizard.shutil.which", return_value="gemini"),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
-                result = run_setup_wizard(store, requested=["google"])
+                result = run_setup_wizard(store, requested=["google"], quick=False)
 
             self.assertEqual(result.providers, ["gemini"])
             saved_text = store.paths.config.read_text(encoding="utf-8")
@@ -150,7 +150,7 @@ class SetupWizardTests(unittest.TestCase):
                 mock.patch("ticky_cli.setup_wizard.subprocess.run", return_value=completed) as run,
                 contextlib.redirect_stdout(io.StringIO()),
             ):
-                run_setup_wizard(store, requested=["xai"])
+                run_setup_wizard(store, requested=["xai"], quick=False)
 
             command, kwargs = run.call_args
             self.assertEqual(command[0], ["grok", "login"])
@@ -185,6 +185,48 @@ class SetupWizardTests(unittest.TestCase):
                 saved["profiles"]["default"]["preferences"],
                 "Keep the current routing.",
             )
+
+    def test_first_time_setup_defaults_to_safe_quick_roster(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(AppPaths(Path(temporary)))
+            output = io.StringIO()
+            with (
+                scripted([
+                    "",  # choose quick setup instead of full customization
+                    "",  # reuse the current provider login
+                ]),
+                contextlib.redirect_stdout(output),
+            ):
+                result = run_setup_wizard(store, requested=["codex"])
+
+            saved = store.load()
+            account = saved["accounts"]["codex-default"]
+            agent = saved["profiles"]["default"]["agents"][0]
+            self.assertEqual(result.providers, ["codex"])
+            self.assertEqual(account["auth"], "inherit")
+            self.assertEqual(agent["account"], "codex-default")
+            self.assertEqual(agent["access"], "read-only")
+            self.assertIsNone(agent["model"])
+            self.assertIn("Quick setup", output.getvalue())
+            self.assertIn("Customize later", output.getvalue())
+
+    def test_quick_ollama_setup_collects_its_required_model(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(AppPaths(Path(temporary)))
+            with (
+                scripted([
+                    "",          # choose quick setup
+                    "",          # local or current Ollama login
+                    "llama3.3",  # required model
+                ]),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                run_setup_wizard(store, requested=["ollama"])
+
+            agent = store.load()["profiles"]["default"]["agents"][0]
+            self.assertEqual(agent["account"], "ollama-default")
+            self.assertEqual(agent["model"], "llama3.3")
+            self.assertEqual(agent["access"], "read-only")
 
 
 if __name__ == "__main__":
