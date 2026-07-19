@@ -206,7 +206,14 @@ class CliIntegrationTests(unittest.TestCase):
                 "",                # add another agent: no
                 "Prefer Scout for research.",
             ]
-            args = argparse.Namespace(yes=False, provider=None, no_install=True, no_link=True)
+            args = argparse.Namespace(
+                yes=False,
+                provider=None,
+                no_install=True,
+                no_link=True,
+                quick=False,
+                customize=True,
+            )
             with (
                 mock.patch.dict(os.environ, {"TICKY_HOME": temporary}),
                 mock.patch("ticky_cli.cli.sys.stdin.isatty", return_value=True),
@@ -222,13 +229,19 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertEqual([agent["name"] for agent in agents], ["scout"])
             self.assertIn("codex-default", saved["accounts"])
 
-    def test_init_interactive_accepting_defaults_keeps_seeded_agent(self):
+    def test_init_interactive_quick_setup_keeps_seeded_agent(self):
         with tempfile.TemporaryDirectory() as temporary:
-            args = argparse.Namespace(yes=False, provider=None, no_install=True, no_link=True)
+            args = argparse.Namespace(
+                yes=False,
+                provider=None,
+                no_install=True,
+                no_link=True,
+                quick=True,
+                customize=False,
+            )
             answers = [
-                "codex", "", "", "", "",  # provider and account
-                "", "", "", "", "", "", "", "", "",  # seeded agent
-                "", "",  # no extra agent, keep general directions
+                "codex",  # provider
+                "",       # existing login
             ]
             with (
                 mock.patch.dict(os.environ, {"TICKY_HOME": temporary}),

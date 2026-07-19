@@ -3,6 +3,7 @@ import io
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -18,13 +19,26 @@ from ticky_cli.config import (
     AppPaths,
     ConfigError,
     ConfigStore,
+    account_record,
     agent_record,
     generated_agent_name,
     new_config,
     validate_config,
     write_env_file,
 )
-from ticky_cli.cli import _selected_account, _symlink_to_path, cmd_account_status, cmd_init
+from ticky_cli.cli import (
+    _selected_account,
+    _symlink_to_path,
+    cmd_account_status,
+    cmd_init,
+    cmd_start,
+    main,
+)
+
+
+class TtyBuffer(io.StringIO):
+    def isatty(self):
+        return True
 
 
 class ModelValidationTests(unittest.TestCase):
@@ -108,6 +122,101 @@ class ConfigBehaviorTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("configured", output.getvalue())
             self.assertIn("validity is checked on first call", output.getvalue())
+
+    def test_account_status_checks_independent_accounts_concurrently(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(AppPaths(Path(temporary)))
+            store.save(new_config(["codex", "claude"]))
+            barrier = threading.Barrier(2)
+            commands = []
+
+            def completed(command, **kwargs):
+                commands.append(command)
+                barrier.wait(timeout=2)
+                return SimpleNamespace(returncode=0, stdout="linked", stderr="")
+
+            output = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"TICKY_HOME": temporary}),
+                mock.patch("ticky_cli.cli.shutil.which", return_value="/fake/provider"),
+                mock.patch("ticky_cli.cli.subprocess.run", side_effect=completed),
+                mock.patch("ticky_cli.cli.auth_status_is_linked", return_value=True),
+                redirect_stdout(output),
+            ):
+                code = cmd_account_status(SimpleNamespace(account=None))
+
+            self.assertEqual(code, 0)
+            self.assertEqual(len(commands), 2)
+            lines = output.getvalue().splitlines()
+            self.assertTrue(lines[0].startswith("claude-default:"), lines)
+            self.assertTrue(lines[1].startswith("codex-default:"), lines)
+
+    def test_start_first_run_keeps_global_registration_opt_in(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = AppPaths(Path(temporary))
+            captured = []
+
+            def setup(args):
+                captured.append(args)
+                config = new_config([])
+                config["accounts"]["mock-default"] = account_record(
+                    "mock-default", "mock", "Mock"
+                )
+                config["profiles"]["default"]["agents"] = [
+                    agent_record("mock-default", name="probe", display="Probe")
+                ]
+                ConfigStore(paths).save(config)
+                return 0
+
+            output = TtyBuffer()
+            with (
+                mock.patch.dict(os.environ, {"TICKY_HOME": temporary}),
+                mock.patch("ticky_cli.cli.sys.stdin.isatty", return_value=True),
+                mock.patch("ticky_cli.cli.cmd_init", side_effect=setup),
+                mock.patch("ticky_cli.cli.cmd_ui", return_value=0) as ui,
+                redirect_stdout(output),
+            ):
+                code = cmd_start(SimpleNamespace(quick=False, customize=False))
+
+            self.assertEqual(code, 0)
+            self.assertEqual(len(captured), 1)
+            self.assertTrue(captured[0].no_install)
+            self.assertTrue(captured[0].no_link)
+            ui.assert_called_once()
+            self.assertIn("Welcome to Ticky", output.getvalue())
+
+    def test_bare_ticky_uses_smart_start_in_a_terminal(self):
+        output = TtyBuffer()
+        with (
+            mock.patch("ticky_cli.cli.sys.stdin.isatty", return_value=True),
+            mock.patch("ticky_cli.cli.cmd_start", return_value=0) as start,
+            redirect_stdout(output),
+        ):
+            code = main([])
+
+        self.assertEqual(code, 0)
+        start.assert_called_once()
+        self.assertEqual(start.call_args.args[0].command, "start")
+
+    def test_start_warns_locally_without_blocking_the_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ConfigStore(AppPaths(Path(temporary))).save(new_config(["codex"]))
+            output = TtyBuffer()
+            with (
+                mock.patch.dict(os.environ, {"TICKY_HOME": temporary}),
+                mock.patch("ticky_cli.cli.sys.stdin.isatty", return_value=True),
+                mock.patch("ticky_cli.cli.shutil.which", return_value=None),
+                mock.patch("ticky_cli.cli.subprocess.run") as provider_check,
+                mock.patch("ticky_cli.cli.cmd_ui", return_value=0) as ui,
+                redirect_stdout(output),
+            ):
+                code = cmd_start(SimpleNamespace(quick=False, customize=False))
+
+            self.assertEqual(code, 0)
+            provider_check.assert_not_called()
+            ui.assert_called_once()
+            self.assertIn("codex CLI was not found", output.getvalue())
+            self.assertIn("Ticky is opening", output.getvalue())
 
     def test_noninteractive_setup_adds_requested_provider_to_existing_config(self):
         with tempfile.TemporaryDirectory() as temporary:

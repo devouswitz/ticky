@@ -11,23 +11,17 @@ WINDOWS_LAUNCHER = ROOT / "Start Ticky.cmd"
 
 
 class LauncherBehaviorTests(unittest.TestCase):
-    def test_windows_launcher_uses_source_wrapper_and_setup(self):
+    def test_windows_launcher_delegates_to_smart_start(self):
         text = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
         self.assertIn('set "PYTHON=py -3"', text)
         self.assertIn('set "PYTHON=python"', text)
-        self.assertIn(
-            '%PYTHON% "%~dp0ticky" setup --no-install --no-link',
-            text,
-        )
-        self.assertLess(
-            text.index('%PYTHON% "%~dp0ticky" status'),
-            text.index('%PYTHON% "%~dp0ticky" ui'),
-        )
-        self.assertIn('%PYTHON% "%~dp0ticky" ui', text)
-        self.assertIn("%USERPROFILE%\\.ticky\\config.json", text)
+        self.assertIn('%PYTHON% "%~dp0ticky" start', text)
+        self.assertNotIn('%PYTHON% "%~dp0ticky" setup', text)
+        self.assertNotIn('%PYTHON% "%~dp0ticky" account status', text)
+        self.assertNotIn('%PYTHON% "%~dp0ticky" ui', text)
 
     @unittest.skipIf(os.name == "nt", "macOS launcher requires zsh")
-    def test_first_launch_setup_does_not_install_or_link_globally(self):
+    def test_first_launch_delegates_setup_policy_to_start(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary, "checkout with spaces")
             checkout.mkdir()
@@ -59,11 +53,11 @@ class LauncherBehaviorTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(
                 calls.read_text(encoding="utf-8").splitlines(),
-                ["setup --no-install --no-link", "status", "account status"],
+                ["start"],
             )
 
     @unittest.skipIf(os.name == "nt", "macOS launcher requires zsh")
-    def test_existing_config_is_checked_before_ui(self):
+    def test_existing_config_uses_the_same_start_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary, "checkout")
             checkout.mkdir()
@@ -94,7 +88,7 @@ class LauncherBehaviorTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(
                 calls.read_text(encoding="utf-8").splitlines(),
-                ["status", "account status"],
+                ["start"],
             )
 
     @unittest.skipIf(os.name == "nt", "macOS launcher requires zsh")
@@ -117,7 +111,7 @@ class LauncherBehaviorTests(unittest.TestCase):
             ticky = checkout / "ticky"
             ticky.write_text(
                 "#!/bin/sh\n"
-                "if [ \"$1\" = status ]; then\n"
+                "if [ \"$1\" = start ]; then\n"
                 "  command -v codex\n"
                 "  command -v grok\n"
                 "fi\n"
@@ -140,7 +134,7 @@ class LauncherBehaviorTests(unittest.TestCase):
             self.assertIn(str(grok), result.stdout)
 
     @unittest.skipIf(os.name == "nt", "macOS launcher requires zsh")
-    def test_status_failure_is_visible_and_propagated(self):
+    def test_start_failure_is_visible_and_propagated(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary, "checkout with spaces")
             checkout.mkdir()
@@ -149,8 +143,7 @@ class LauncherBehaviorTests(unittest.TestCase):
             ticky = checkout / "ticky"
             ticky.write_text(
                 "#!/bin/sh\n"
-                "if [ \"$1\" = setup ]; then exit 0; fi\n"
-                "if [ \"$1\" = status ]; then echo status failed >&2; exit 7; fi\n"
+                "if [ \"$1\" = start ]; then echo start failed >&2; exit 7; fi\n"
                 "exit 9\n",
                 encoding="utf-8",
             )
@@ -165,9 +158,8 @@ class LauncherBehaviorTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 7)
-            self.assertIn("status failed", result.stderr)
-            self.assertIn("status check failed with exit code 7", result.stdout)
-            self.assertNotIn("Ticky is ready", result.stdout)
+            self.assertIn("start failed", result.stderr)
+            self.assertIn("Ticky could not start", result.stdout)
 
 
 if __name__ == "__main__":
