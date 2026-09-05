@@ -67,6 +67,11 @@ class ParseInputTests(unittest.TestCase):
         self.assertEqual(parsed.agent, "lark")
         self.assertEqual(parsed.text, "")
 
+    def test_at_agent_accepts_tabs_and_preserves_multiline_task(self):
+        parsed = parse_input("@Lark\treview this:\n    pass\n\nthen explain")
+        self.assertEqual(parsed.agent, "lark")
+        self.assertEqual(parsed.text, "review this:\n    pass\n\nthen explain")
+
     def test_plain_task(self):
         parsed = parse_input("summarize the repo")
         self.assertEqual(parsed.kind, "task")
@@ -178,6 +183,107 @@ class SessionCommandTests(unittest.TestCase):
         agent = self.saved_agent("vale")
         self.assertEqual(agent["model"], "gpt-5.5")
         self.assertEqual(agent["thinking"], "xhigh")
+
+    def test_paste_dispatches_one_task_with_blank_lines_and_indentation(self):
+        with mock.patch("builtins.input", side_effect=[
+            "review this:", "", "    return True", "/quit", "/send",
+        ]), mock.patch.object(self.session, "dispatch") as dispatch:
+            self.run_command("/paste rook")
+        dispatch.assert_called_once()
+        agent, task = dispatch.call_args.args
+        self.assertEqual(agent["name"], "rook")
+        self.assertEqual(task, "review this:\n\n    return True\n/quit")
+
+    def test_paste_uses_pin_and_can_be_cancelled_without_dispatch(self):
+        self.run_command("/use rook")
+        for ending in ("/cancel", EOFError(), KeyboardInterrupt()):
+            with self.subTest(ending=ending), mock.patch(
+                "builtins.input", side_effect=["unfinished", ending],
+            ), mock.patch.object(self.session, "dispatch") as dispatch:
+                output = self.run_command("/paste")
+                self.assertIn("Rook", output)
+                dispatch.assert_not_called()
+
+    def test_paste_refuses_a_changed_provider_binding(self):
+        answers = iter(["a private task", "/send"])
+
+        def compose(prompt):
+            line = next(answers)
+            if line == "/send":
+                config = self.store.load()
+                config["profiles"]["default"]["agents"][0]["model"] = "other-model"
+                self.store.save(config)
+            return line
+
+        with mock.patch("builtins.input", side_effect=compose), mock.patch.object(
+            self.session, "dispatch",
+        ) as dispatch:
+            output = self.run_command("/paste vale")
+        dispatch.assert_not_called()
+        self.assertIn("task was not sent", output)
+
+    def test_blank_paste_does_not_start_a_call(self):
+        with mock.patch("builtins.input", side_effect=["", "  ", "/send"]), mock.patch.object(
+            self.session, "dispatch",
+        ) as dispatch:
+            self.run_command("/paste")
+        dispatch.assert_not_called()
+
+    def test_completion_follows_command_position_and_enabled_roster(self):
+        self.session.config["profiles"]["default"]["agents"][1]["enabled"] = False
+        self.assertIn("@vale", self.session._completer_options())
+        self.assertNotIn("@rook", self.session._completer_options())
+        self.assertEqual(self.session._completer_options("/use "), ["vale", "auto"])
+        self.assertEqual(self.session._completer_options("/paste "), ["vale"])
+        self.assertIn("default", self.session._completer_options("/profile delete "))
+        self.assertIn("high", self.session._completer_options("/model vale model-name "))
+        self.assertEqual(self.session._completer_options("explain this "), [])
+
+    def test_context_is_isolated_when_profile_or_agent_binding_changes(self):
+        agent = pick_agent(self.session.config, "default", "vale")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.session.dispatch(agent, "private task in the original workspace")
+        original = self.session._conversation_key(agent)
+        self.assertIn("private task", self.session.transcripts[original][0][0])
+        self.run_command("/profile save other")
+        self.run_command("/profile other")
+        other = pick_agent(self.session.config, "other", "vale")
+        self.assertNotIn(self.session._conversation_key(other), self.session.transcripts)
+        self.run_command("/profile default")
+        agent = pick_agent(self.session.config, "default", "vale")
+        self.assertEqual(self.session._conversation_key(agent), original)
+        for field, value in (("model", "other-model"), ("workdir", "/another-workspace"),
+                             ("access", "workspace-write")):
+            changed = dict(agent, **{field: value})
+            self.assertNotIn(self.session._conversation_key(changed), self.session.transcripts)
+        self.session.config["accounts"]["other-account"] = account_record(
+            "other-account", "mock", "Other",
+        )
+        changed = dict(agent, account="other-account")
+        self.assertNotIn(self.session._conversation_key(changed), self.session.transcripts)
+        self.session.config["accounts"][agent["account"]]["api"] = {
+            "protocol": "openai-chat", "endpoint": "https://another.example/chat",
+        }
+        self.assertNotIn(self.session._conversation_key(agent), self.session.transcripts)
+        self.run_command("/new")
+        self.assertEqual(self.session.transcripts, {})
+
+    def test_running_activity_announces_its_completion_once(self):
+        from ticky_cli.runtime import Activity
+        activity = Activity(self.paths, "test-boss")
+        agent = pick_agent(self.session.config, "default", "vale")
+        account = self.session.config["accounts"][agent["account"]]
+        call_id = activity.start(boss="codex", profile="default", agent=agent,
+                                 account=account, reason="review")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.session.show_new_activity()
+            self.session.show_new_activity()
+            activity.finish(call_id, ok=True, duration=1, text="done")
+            self.session.show_new_activity()
+            self.session.show_new_activity()
+        self.assertEqual(output.getvalue().count("is running for codex"), 1)
+        self.assertEqual(output.getvalue().count("finished for codex"), 1)
 
     def test_agents_explains_how_to_fix_an_empty_profile(self):
         self.session.config["profiles"]["default"]["agents"] = []
@@ -392,7 +498,7 @@ class McpConfigReloadTests(unittest.TestCase):
             server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
             first = json.loads(sink.getvalue().splitlines()[-1])
             names = {tool["name"] for tool in first["result"]["tools"]}
-            self.assertEqual(names, {"ask_vale", "ticky_roster"})
+            self.assertEqual(names, {"ask_vale", "ticky_roster", "ticky_team"})
 
             edited = mock_config(("vale", "rook"))
             store.save(edited)
@@ -403,7 +509,7 @@ class McpConfigReloadTests(unittest.TestCase):
             server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
             second = json.loads(sink.getvalue().splitlines()[-1])
             names = {tool["name"] for tool in second["result"]["tools"]}
-            self.assertEqual(names, {"ask_vale", "ask_rook", "ticky_roster"})
+            self.assertEqual(names, {"ask_vale", "ask_rook", "ticky_roster", "ticky_team"})
 
             server.handle({
                 "jsonrpc": "2.0", "id": 3, "method": "tools/call",
@@ -431,7 +537,7 @@ class McpConfigReloadTests(unittest.TestCase):
             server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
             response = json.loads(sink.getvalue().splitlines()[-1])
             names = {tool["name"] for tool in response["result"]["tools"]}
-            self.assertEqual(names, {"ask_vale", "ticky_roster"})
+            self.assertEqual(names, {"ask_vale", "ticky_roster", "ticky_team"})
 
 
 if __name__ == "__main__":

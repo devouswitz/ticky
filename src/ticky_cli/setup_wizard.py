@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import getpass
+import json
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from .config import (
 )
 from .credentials import set_api_key
 from .providers import login_command
+from .api_provider import DEFAULT_ENDPOINTS, PROTOCOLS, validate_spec
 from .wizard import MODEL_HINTS, ask, ask_bool, ask_choice, prompt_agent
 
 AUTH_CHOICES = ("existing-login", "separate-login", "api-key")
@@ -43,7 +45,7 @@ class SetupResult:
 def detected_providers() -> list[str]:
     return [
         provider for provider in SETUP_PROVIDERS
-        if shutil.which(PROVIDER_EXECUTABLES[provider])
+        if PROVIDER_EXECUTABLES.get(provider) and shutil.which(PROVIDER_EXECUTABLES[provider])
     ]
 
 
@@ -79,7 +81,8 @@ def _choose_providers(config: dict[str, Any] | None,
     defaults = _provider_defaults(config)
     print("\nAI services")
     for provider in SETUP_PROVIDERS:
-        installed = "installed" if shutil.which(PROVIDER_EXECUTABLES[provider]) else "not installed"
+        executable = PROVIDER_EXECUTABLES.get(provider)
+        installed = ("installed" if shutil.which(executable) else "not installed") if executable else "no bundled CLI required"
         print(f"  {provider:<7} {PROVIDER_LABELS[provider]} ({installed})")
     while True:
         raw = ask(
@@ -125,6 +128,8 @@ def _run_login(store: ConfigStore, account: dict[str, Any]) -> None:
 
 def _configure_provider_account(store: ConfigStore, config: dict[str, Any],
                                 provider: str, *, quick: bool = False) -> list[str]:
+    if provider in ("api", "command"):
+        return _configure_adapter_account(store, config, provider)
     existing = [
         account for account in config["accounts"].values()
         if account["provider"] == provider and account.get("enabled", True)
@@ -223,6 +228,74 @@ def _configure_provider_account(store: ConfigStore, config: dict[str, Any],
     return [account_id]
 
 
+def _configure_adapter_account(store: ConfigStore, config: dict[str, Any], provider: str) -> list[str]:
+    existing = [account for account in config["accounts"].values()
+                if account["provider"] == provider and account.get("enabled", True)]
+    if existing:
+        print("\nConfigured: " + ", ".join(account["id"] for account in existing))
+        if not ask_bool("Add another endpoint or command", False):
+            return [account["id"] for account in existing]
+    label = ask("Account name", "My API" if provider == "api" else "My AI command")
+    account_id = _unused_account_id(config, label)
+    account = account_record(account_id, provider, label, "inherit")
+    if provider == "api":
+        protocol = ask_choice("API protocol", PROTOCOLS, "openai-chat", {
+            "openai-chat": "OpenAI Chat Completions or a compatible endpoint",
+            "openai-responses": "OpenAI Responses API",
+            "anthropic": "Anthropic Messages API",
+            "gemini": "Google Gemini generateContent API",
+            "custom": "custom JSON request and response mapping",
+        })
+        while True:
+            endpoint = ask("Complete endpoint URL", DEFAULT_ENDPOINTS.get(protocol, ""))
+            spec: dict[str, Any] = {"protocol": protocol, "endpoint": endpoint}
+            if protocol == "custom":
+                try:
+                    spec["request"] = json.loads(ask("JSON body template", '{"model":"{model}","prompt":"{prompt}"}'))
+                except json.JSONDecodeError:
+                    print("Enter a valid JSON object.")
+                    continue
+                spec["response_pointer"] = ask("Response text JSON pointer", "/text")
+            try:
+                validate_spec(spec)
+            except ValueError as error:
+                print(error)
+                continue
+            account["api"] = spec
+            break
+        while True:
+            model = ask("Model ID")
+            if model and not model.startswith("-"):
+                account["default_model"] = model
+                break
+            print("Enter the model ID accepted by this endpoint.")
+        key = getpass.getpass("API key (hidden; Return for an unauthenticated endpoint): ").strip()
+        if key:
+            if protocol == "custom":
+                account["api"]["auth_header"] = ask("API key header", "Authorization")
+                account["api"]["auth_prefix"] = ask("Key prefix (use - for none)", "Bearer", clearable=True)
+                if account["api"]["auth_prefix"]:
+                    account["api"]["auth_prefix"] += " "
+                validate_spec(account["api"])
+            set_api_key(store.paths, account, key)
+    else:
+        while True:
+            try:
+                command = json.loads(ask("Command as JSON argv; prompt goes to stdin", '["my-ai", "--model", "{model}"]'))
+                if not isinstance(command, list) or not command or not all(isinstance(part, str) and part for part in command):
+                    raise ValueError
+            except (ValueError, json.JSONDecodeError):
+                print("Enter a JSON array of command arguments.")
+                continue
+            account["command"] = command
+            break
+        account["default_model"] = ask("Model ID (optional)") or None
+        if not ask_bool("Allow this custom command to run with your user permissions; Ticky cannot sandbox it", False):
+            raise ConfigError("custom command was not enabled")
+    config["accounts"][account_id] = account
+    return [account_id]
+
+
 def _seed_missing_agents(config: dict[str, Any], account_ids: Iterable[str]) -> None:
     selected = config["profiles"][config["active_profile"]]
     existing_names = [agent["name"] for agent in selected["agents"]]
@@ -236,6 +309,9 @@ def _seed_missing_agents(config: dict[str, Any], account_ids: Iterable[str]) -> 
             existing_names,
             specialty=f"General-purpose {PROVIDER_LABELS[provider]} subagent.",
         )
+        agent["model"] = config["accounts"][account_id].get("default_model")
+        if provider == "command":
+            agent["access"] = "full"
         existing_names.append(agent["name"])
         selected["agents"].append(agent)
 
@@ -257,8 +333,7 @@ def _configure_roster(store: ConfigStore, config: dict[str, Any], *, first_time:
                 print("Enter an installed local model or an Ollama Cloud model name.")
         store.save(config)
         print(
-            f"  Ready with {len(selected['agents'])} generated, read-only "
-            "agent(s) using safe defaults."
+            f"  Ready with {len(selected['agents'])} agent(s)."
         )
         print("  Customize later with `/roster`, `/model`, or `/setup`.")
         return

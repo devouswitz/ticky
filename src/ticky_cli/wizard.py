@@ -31,6 +31,8 @@ MODEL_HINTS = {
     "gemini": "blank = provider default; examples: gemini-3-pro, gemini-3-flash",
     "grok": "blank = provider default; examples: grok-build, grok-composer-2.5-fast",
     "ollama": "required; examples: gpt-oss:20b, llama3.3, gpt-oss:120b-cloud",
+    "api": "required; model ID accepted by your endpoint",
+    "command": "blank = command default",
     "mock": "blank = provider default",
 }
 ROSTER_ACTIONS = ("add", "edit", "remove", "preferences", "done")
@@ -171,15 +173,18 @@ def prompt_agent(config: dict[str, Any], existing: Sequence[str],
             record.get("model") or "",
             clearable=True,
         ) or None
-        if provider != "ollama" or record["model"]:
+        if provider not in ("ollama", "api") or record["model"]:
             break
-        print("Ollama agents need a model name, for example gpt-oss:20b or llama3.3.")
-    record["thinking"] = ask_choice(
+        print("This provider needs a model name.")
+    record["thinking"] = "default" if provider == "api" else ask_choice(
         "Thinking effort", THINKING_LEVELS, record.get("thinking") or "default",
     )
     access_default = record.get("access") or "read-only"
     while True:
         access = ask_choice("Access level", ACCESS_LEVELS, access_default, ACCESS_HELP)
+        if provider == "command" and access != "full":
+            print("Custom commands require full access because Ticky cannot sandbox an unknown CLI.")
+            continue
         if access != "full" or ask_bool(
             "Full access can disable sandbox and provider permission safeguards. Enable it",
             False,

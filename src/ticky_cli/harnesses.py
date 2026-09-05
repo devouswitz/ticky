@@ -40,7 +40,7 @@ def server_command(profile_name: str | None = None, *, platform: str | None = No
 
 def mcp_json(profile_name: str | None = None) -> dict[str, Any]:
     command, arguments = server_command(profile_name)
-    return {
+    result = {
         "mcpServers": {
             "ticky": {
                 "command": command,
@@ -48,6 +48,11 @@ def mcp_json(profile_name: str | None = None) -> dict[str, Any]:
             }
         }
     }
+    if os.environ.get("TICKY_HOME"):
+        result["mcpServers"]["ticky"]["env"] = {
+            "TICKY_HOME": str(Path(os.environ["TICKY_HOME"]).expanduser().resolve())
+        }
+    return result
 
 
 def _registration_config(target: str) -> Path:

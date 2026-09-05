@@ -75,6 +75,8 @@ def _unique_providers(providers: list[str] | None) -> list[str]:
 
 def _merge_provider_defaults(config: dict[str, Any], providers: list[str]) -> bool:
     """Add noninteractive provider defaults without replacing existing setup."""
+    if any(provider in ("api", "command") for provider in providers):
+        raise ConfigError("API and custom command setup needs an endpoint or argv; run interactive `ticky setup` or `ticky account add`")
     changed = False
     _, selected = find_profile(config)
     names = [agent["name"] for agent in selected["agents"]]
@@ -143,6 +145,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     existing = store.load(required=False)
     requested = _unique_providers(args.provider)
     interactive = not args.yes and sys.stdin.isatty()
+    if not interactive and any(provider in ("api", "command") for provider in requested):
+        fail("API and custom command accounts need connection details; run `ticky setup` interactively or `ticky account add --help`")
     if interactive:
         quick: bool | None = None
         if getattr(args, "quick", False):
@@ -226,11 +230,11 @@ def cmd_account_list(args: argparse.Namespace) -> int:
 
 def cmd_account_add(args: argparse.Namespace) -> int:
     store = _store()
-    config = store.load()
+    config = store.load(required=False) or new_config([])
     provider = args.provider
     if provider is None and sys.stdin.isatty():
         provider = input(
-            "Provider (codex/claude/gemini/grok/ollama): "
+            "Provider (codex/claude/gemini/grok/ollama/api/command): "
         ).strip().lower()
     if provider is None:
         fail("--provider is required outside an interactive terminal")
@@ -244,11 +248,33 @@ def cmd_account_add(args: argparse.Namespace) -> int:
             fail(f"account {account_id!r} already exists")
         account_id = f"{base}-{suffix}"
         suffix += 1
-    auth = args.auth or ("inherit" if provider == "ollama" else "isolated")
-    config["accounts"][account_id] = account_record(account_id, provider, label, auth, args.home)
+    auth = args.auth or ("inherit" if provider in ("ollama", "command") else "api-key" if provider == "api" else "isolated")
+    record = account_record(account_id, provider, label, auth, args.home)
+    if provider == "api":
+        from .api_provider import DEFAULT_ENDPOINTS
+        try:
+            if args.adapter:
+                record["api"] = json.loads(Path(args.adapter).expanduser().read_text(encoding="utf-8"))
+            else:
+                protocol = args.protocol or "openai-chat"
+                record["api"] = {"protocol": protocol, "endpoint": args.endpoint or DEFAULT_ENDPOINTS.get(protocol, "")}
+        except (OSError, json.JSONDecodeError) as error:
+            raise ConfigError("could not read a valid JSON API adapter file") from error
+    elif provider == "command":
+        if not args.argv:
+            fail("custom commands need --argv as a JSON array; prompts go to stdin")
+        try:
+            record["command"] = json.loads(args.argv)
+        except json.JSONDecodeError as error:
+            raise ConfigError("--argv must be a JSON array of command arguments") from error
+    config["accounts"][account_id] = record
     store.save(config)
     print(f"added account {account_id} ({provider}, {auth})")
-    if provider == "mock":
+    if provider in ("mock", "command"):
+        return 0
+    if provider == "api":
+        if auth == "api-key":
+            print(f"Set the key with `ticky account key set {account_id}`.")
         return 0
     if args.login:
         return _account_login(config["accounts"][account_id], store.paths)
@@ -279,6 +305,12 @@ def _account_status_line(paths: AppPaths, account_id: str,
     executable = PROVIDER_EXECUTABLES.get(account["provider"])
     if account["provider"] == "mock":
         return True, f"{account_id}: configured: built-in test provider"
+    if account["provider"] == "api":
+        ready, summary = api_key_ready(paths, account) if account.get("auth") == "api-key" else (True, "unauthenticated endpoint")
+        return ready, f"{account_id}: {'configured' if ready else 'not configured'}: {summary}; endpoint validity is checked on first call"
+    if account["provider"] == "command":
+        ready = bool(shutil.which(account["command"][0]))
+        return ready, f"{account_id}: custom command {'found' if ready else 'not found'}; full user permissions"
     if account.get("auth") == "api-key":
         ready, summary = api_key_ready(paths, account)
         if (
@@ -350,8 +382,6 @@ def cmd_account_status(args: argparse.Namespace) -> int:
     for _, line in results:
         print(line)
     return 0 if all(ok for ok, _ in results) else 1
-
-
 
 
 def cmd_account_remove(args: argparse.Namespace) -> int:
@@ -672,6 +702,18 @@ def cmd_roster(args: argparse.Namespace) -> int:
     return run_roster_wizard(store, config, profile_name)
 
 
+def cmd_team(args: argparse.Namespace) -> int:
+    from .team import run_team
+    store = _store()
+    config = store.load()
+    task = sys.stdin.read() if args.task == "-" else args.task
+    result = run_team(config, store.paths, args.agents.split(","), task,
+                      mode=args.mode, lead=args.lead, context=args.context,
+                      profile_name=args.profile, reason=args.reason or "terminal team task")
+    print(result.text())
+    return 0 if result.ok else 1
+
+
 def cmd_call(args: argparse.Namespace) -> int:
     store = _store()
     config = store.load()
@@ -720,20 +762,21 @@ def _startup_warnings(config: dict[str, Any], paths: AppPaths) -> list[str]:
         if account_id not in checked_accounts:
             checked_accounts.add(account_id)
             provider = account["provider"]
-            executable = PROVIDER_EXECUTABLES.get(provider)
+            executable = (account["command"][0] if provider == "command"
+                          else PROVIDER_EXECUTABLES.get(provider))
             if account.get("auth") == "api-key":
                 ready, summary = api_key_ready(paths, account)
                 if not ready:
                     warnings.append(f"{account_id}: {summary}")
             cli_required = not (
-                provider == "mock"
+                provider in ("mock", "api")
                 or (provider == "ollama" and account.get("auth") == "api-key")
             )
             if cli_required and executable and not shutil.which(executable):
                 warnings.append(f"{account_id}: {executable} CLI was not found")
-        if account["provider"] == "ollama" and not agent.get("model"):
+        if account["provider"] in ("ollama", "api") and not agent.get("model"):
             warnings.append(
-                f"{agent['display']}: choose an Ollama model with `/model {agent['name']}`"
+                f"{agent['display']}: choose a model with `/model {agent['name']}`"
             )
     return warnings
 
@@ -860,9 +903,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"active profile: {config['active_profile']}")
     print(f"accounts: {len(config['accounts'])}; profiles: {len(config['profiles'])}")
     for account_id, account in sorted(config["accounts"].items()):
-        executable = PROVIDER_EXECUTABLES.get(account["provider"])
+        executable = (account["command"][0] if account["provider"] == "command"
+                      else PROVIDER_EXECUTABLES.get(account["provider"]))
         required = not (
-            account["provider"] == "mock"
+            account["provider"] in ("mock", "api")
             or (account["provider"] == "ollama" and account.get("auth") == "api-key")
         )
         installed = bool(shutil.which(executable)) if executable and required else True
@@ -905,7 +949,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         by_id = {item.get("id"): item for item in responses}
         checks = {
             "MCP handshake": 1 in by_id and "result" in by_id[1],
-            "tools/list": 2 in by_id and len(by_id[2].get("result", {}).get("tools", [])) == 2,
+            "tools/list": 2 in by_id and {tool["name"] for tool in by_id[2].get("result", {}).get("tools", [])} == {"ask_probe", "ticky_roster", "ticky_team"},
             "mock tools/call": 3 in by_id and not by_id[3].get("result", {}).get("isError", True),
             "activity cleanup": not read_state(paths).get("running"),
             "completion log": len(read_log_tail(paths, 5)) == 1,
@@ -922,7 +966,7 @@ def _add_profile_option(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ticky",
-        description="Link AI CLI accounts and expose named cross-platform subagents to LLM harnesses.",
+        description="Connect AI APIs, CLIs and local models as named agents and cross-provider teams.",
     )
     parser.add_argument("--version", action="version", version=f"ticky {__version__}")
     commands = parser.add_subparsers(dest="command")
@@ -949,7 +993,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--yes", "-y", action="store_true", help="accept detected providers without prompts")
     init.add_argument(
         "--provider", action="append",
-        choices=tuple(PROVIDER_EXECUTABLES) + tuple(PROVIDER_ALIASES),
+        choices=tuple(provider for provider in PROVIDERS if provider != "mock") + tuple(PROVIDER_ALIASES),
         help="provider to configure or register (repeatable)",
     )
     init.add_argument("--no-install", action="store_true", help="do not register MCP with known harnesses")
@@ -976,6 +1020,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_argument("--auth", choices=AUTH_MODES)
     sub.add_argument("--home")
     sub.add_argument("--login", action="store_true")
+    sub.add_argument("--protocol", choices=("openai-chat", "openai-responses", "anthropic", "gemini", "custom"))
+    sub.add_argument("--endpoint", help="complete API generation endpoint URL")
+    sub.add_argument("--adapter", help="JSON API adapter file, including protocol and endpoint")
+    sub.add_argument("--argv", help="custom command as a JSON array; prompt is passed on stdin")
     sub.set_defaults(handler=cmd_account_add)
     sub = account_commands.add_parser("login")
     sub.add_argument("account")
@@ -1065,6 +1113,16 @@ def build_parser() -> argparse.ArgumentParser:
     call.add_argument("-c", "--context")
     _add_profile_option(call)
     call.set_defaults(handler=cmd_call)
+
+    team = commands.add_parser("team", help="coordinate agents across providers")
+    team.add_argument("agents", help="comma-separated agent names, in relay order")
+    team.add_argument("task", help="complete task, or - to read stdin")
+    team.add_argument("--mode", choices=("relay", "parallel"), default="relay")
+    team.add_argument("--lead", help="agent that synthesizes the results")
+    team.add_argument("--reason")
+    team.add_argument("--context")
+    _add_profile_option(team)
+    team.set_defaults(handler=cmd_team)
 
     serve = commands.add_parser("serve", help="run the MCP stdio server")
     _add_profile_option(serve)

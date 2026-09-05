@@ -1,7 +1,7 @@
 """Interactive terminal session: a Claude Code-style front end for the roster.
 
 Run with bare `ticky`, `ticky start`, or `ticky ui`. Type a task to dispatch it
-to the best-fitting agent, `@name task` to target one, or `/help` for commands.
+by roster priority, `@name task` to target one, or `/help` for commands.
 Live activity from connected harnesses shows up between prompts, so there is no
 need for a separate `ticky watch` window.
 """
@@ -9,6 +9,7 @@ need for a separate `ticky watch` window.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import random
 import re
@@ -47,6 +48,8 @@ SLASH_COMMANDS: dict[str, str] = {
     "/setup": "guided accounts, API keys, models, taglines, and directions",
     "/agents": "show the roster with models, effort, and access",
     "/use": "/use <agent|auto>  pin every plain task to one agent",
+    "/paste": "/paste [agent]  compose a multiline task; /send runs it",
+    "/team": "/team <name,name> <task>  pass work between agents in order",
     "/model": "/model <agent> [model] [effort]  show or change model and thinking effort",
     "/tagline": "/tagline <agent> [text]  show or change the one-line specialty the boss reads",
     "/roster": "guided editor: add, edit, or remove agents without leaving the session",
@@ -110,8 +113,9 @@ def parse_input(raw: str) -> ParsedInput:
         parts = stripped.split()
         return ParsedInput("slash", command=parts[0].lower(), args=parts[1:])
     if stripped.startswith("@"):
-        head, _, rest = stripped.partition(" ")
-        return ParsedInput("task", agent=head[1:].lower(), text=rest.strip())
+        parts = stripped.split(maxsplit=1)
+        return ParsedInput("task", agent=parts[0][1:].lower(),
+                           text=parts[1] if len(parts) > 1 else "")
     return ParsedInput("task", text=stripped)
 
 
@@ -198,9 +202,10 @@ class Session:
         self._config_mtime = self._config_stamp()
         self.profile_name = self.config["active_profile"]
         self.pinned_agent: str | None = None
-        self.transcripts: dict[str, list[tuple[str, str]]] = {}
+        self.transcripts: dict[tuple[str, ...], list[tuple[str, str]]] = {}
         self.activity = Activity(self.paths, f"{BOSS_LABEL}-{os.getpid()}")
         self._seen_calls: set[str] = set()
+        self._announced_running: set[str] = set()
         self._interrupt_armed = False
 
     # -- config freshness -------------------------------------------------
@@ -311,11 +316,12 @@ class Session:
         state = read_state(self.paths)
         for call in state.get("running") or []:
             call_id = call.get("call_id")
-            if not call_id or call_id in self._seen_calls:
+            if (not call_id or call_id in self._seen_calls
+                    or call_id in self._announced_running):
                 continue
             if str(call.get("boss") or "").startswith(BOSS_LABEL):
                 continue
-            self._seen_calls.add(call_id)
+            self._announced_running.add(call_id)
             self.say_mark(style.dim("◐"), (
                 f"{call.get('agent', '?')} is running for {call.get('boss', '?')}"
                 f" · {call.get('reason', '')}"
@@ -325,6 +331,7 @@ class Session:
             if not call_id or call_id in self._seen_calls:
                 continue
             self._seen_calls.add(call_id)
+            self._announced_running.discard(call_id)
             if str(entry.get("boss") or "").startswith(BOSS_LABEL):
                 continue
             mark = style.ok("✓") if entry.get("status") == "ok" else style.err("✗")
@@ -335,9 +342,19 @@ class Session:
 
     # -- dispatch ------------------------------------------------------------
 
+    def _conversation_key(self, agent: dict[str, Any]) -> tuple[str, ...]:
+        account = self.config["accounts"][agent["account"]]
+        return (
+            self.profile_name, agent["name"], account["id"],
+            account["provider"], str(agent.get("model") or ""),
+            str(agent.get("workdir") or ""), agent["access"],
+            json.dumps({key: account.get(key) for key in ("api", "command", "auth", "home")}, sort_keys=True),
+        )
+
     def dispatch(self, agent: dict[str, Any], task: str) -> None:
         account = self.config["accounts"][agent["account"]]
-        context = build_session_context(self.transcripts.get(agent["name"], []))
+        conversation_key = self._conversation_key(agent)
+        context = build_session_context(self.transcripts.get(conversation_key, []))
         reason = "interactive ticky session"
         call_id = self.activity.start(
             boss=BOSS_LABEL, profile=self.profile_name, agent=agent, account=account,
@@ -355,7 +372,7 @@ class Session:
         self.activity.finish(call_id, ok=result.ok, duration=result.duration, text=result.text)
         self._print_result(agent, result, interrupted)
         if result.ok:
-            history = self.transcripts.setdefault(agent["name"], [])
+            history = self.transcripts.setdefault(conversation_key, [])
             history.append((task, result.text))
             del history[:-MAX_CONTEXT_EXCHANGES]
 
@@ -433,7 +450,7 @@ class Session:
             self.say(style.bold("commands"))
             for command, blurb in SLASH_COMMANDS.items():
                 self.say_pair(command, blurb, pad=10, lead="  ")
-            self.say_dim("plain text goes to the best-fitting agent; @name text targets one.",
+            self.say_dim("plain text uses roster priority; @name text targets one.",
                          "  ")
             self.say_dim("follow-ups to the same agent carry recent exchanges; /new resets that.",
                          "  ")
@@ -462,6 +479,17 @@ class Session:
                 agent = pick_agent(self.config, self.profile_name, args[0])
                 self.pinned_agent = agent["name"]
                 self.say(style.dim(f"plain tasks now go to {agent['display']}"))
+        elif name == "/paste":
+            self._command_paste(args)
+        elif name == "/team":
+            from .team import run_team
+            if len(args) < 2:
+                self.say(style.err("usage: /team <name,name> <task>"))
+            else:
+                result = run_team(self.config, self.paths, args[0].split(","), " ".join(args[1:]),
+                                  profile_name=self.profile_name, boss=BOSS_LABEL)
+                for line in render_response(result.text(), style, max(self.width - 2, 40)):
+                    self.say(line)
         elif name == "/model":
             self._command_model(args)
         elif name == "/tagline":
@@ -712,12 +740,53 @@ class Session:
 
     # -- input ---------------------------------------------------------------
 
-    def _completer_options(self) -> list[str]:
-        options = list(SLASH_COMMANDS)
-        options.extend(
-            f"@{agent['name']}" for agent in enabled_agents(self.config, self.profile_name)
-        )
-        return options
+    def _command_paste(self, args: list[str]) -> None:
+        if len(args) > 1:
+            self.say(self.style.err("usage: /paste [agent]"))
+            return
+        requested = args[0].removeprefix("@") if args else self.pinned_agent
+        agent = pick_agent(self.config, self.profile_name, requested)
+        binding = self._conversation_key(agent)
+        self.say_dim(f"{agent['display']} · /send to run · /cancel to discard")
+        lines: list[str] = []
+        try:
+            while True:
+                line = input("│ … ")
+                if line.strip() == "/cancel":
+                    return
+                if line.strip() == "/send":
+                    task = "\n".join(lines)
+                    if task.strip():
+                        # Re-read the roster before dispatching a buffered task.
+                        self.refresh_config()
+                        current_agent = pick_agent(
+                            self.config, self.profile_name, agent["name"],
+                        )
+                        if self._conversation_key(current_agent) != binding:
+                            self.say(self.style.err("agent changed while composing; task was not sent"))
+                            return
+                        self.dispatch(current_agent, task)
+                    return
+                lines.append(line)
+        except (EOFError, KeyboardInterrupt):
+            self.say()
+
+    def _completer_options(self, before: str = "") -> list[str]:
+        names = [agent["name"] for agent in enabled_agents(self.config, self.profile_name)]
+        parts = before.split()
+        if not parts:
+            return list(SLASH_COMMANDS) + [f"@{name}" for name in names]
+        command = parts[0]
+        if len(parts) == 1:
+            if command in ("/use", "/paste", "/model", "/tagline"):
+                return names + (["auto"] if command == "/use" else [])
+            if command == "/profile":
+                return sorted(self.config["profiles"]) + ["save", "rename", "delete"]
+        if command == "/profile" and len(parts) == 2 and parts[1] in ("rename", "delete"):
+            return sorted(self.config["profiles"])
+        if command == "/model" and len(parts) == 3:
+            return list(THINKING_LEVELS)
+        return []
 
     def _setup_readline(self) -> None:
         if readline is None:
@@ -732,11 +801,12 @@ class Session:
         import atexit
         self.paths.ensure()
         atexit.register(lambda: self._save_history(history))
-        readline.set_completer_delims(" ")
+        readline.set_completer_delims(" \t\n")
 
         def complete(text: str, state: int) -> str | None:
-            matches = [option for option in self._completer_options()
-                       if option.startswith(text)] if text else []
+            before = readline.get_line_buffer()[:readline.get_begidx()]
+            matches = [option for option in self._completer_options(before)
+                       if option.startswith(text)]
             return matches[state] if state < len(matches) else None
 
         readline.set_completer(complete)

@@ -136,7 +136,7 @@ class McpAndActivityBehaviorTests(unittest.TestCase):
                 "reason": "UI testing",
             }], "watch-test")
             result = subprocess.run(
-                [str(TICKY), "watch", "--once"],
+                [sys.executable, str(TICKY), "watch", "--once"],
                 cwd=ROOT,
                 env=dict(os.environ, TICKY_HOME=temporary),
                 text=True,
@@ -151,7 +151,7 @@ class McpAndActivityBehaviorTests(unittest.TestCase):
     def test_doctor_exercises_mcp_and_activity_pipeline(self):
         with tempfile.TemporaryDirectory() as temporary:
             result = subprocess.run(
-                [str(TICKY), "doctor"],
+                [sys.executable, str(TICKY), "doctor"],
                 cwd=ROOT,
                 env=dict(os.environ, TICKY_HOME=temporary),
                 text=True,
@@ -168,7 +168,7 @@ class McpAndActivityBehaviorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             paths = AppPaths(Path(temporary))
             process = subprocess.Popen(
-                [str(TICKY), "log", "--follow"],
+                [sys.executable, str(TICKY), "log", "--follow"],
                 cwd=ROOT,
                 env=dict(os.environ, TICKY_HOME=temporary),
                 text=True,

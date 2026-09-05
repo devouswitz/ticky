@@ -25,7 +25,7 @@ def tool_name(agent: dict[str, Any]) -> str:
 def tool_definition(agent: dict[str, Any], account: dict[str, Any]) -> dict[str, Any]:
     model = agent.get("model") or "provider default"
     description = (
-        f"{agent['display']} ({account['provider']} account {account['id']}). "
+        f"{agent['display']} ({account.get('label') or account['provider']}, account {account['id']}). "
         f"{agent.get('specialty') or 'General-purpose subagent.'} "
         f"{agent.get('routing_note') or ''} "
         f"Priority {agent['priority']} (lower numbers are preferred). "
@@ -34,6 +34,10 @@ def tool_definition(agent: dict[str, Any], account: dict[str, Any]) -> dict[str,
         "Call this tool only when that specialty and access fit the task. "
         "The call runs synchronously and returns the subagent's final response."
     )
+    if account["provider"] == "api":
+        description += " Direct API text response only; no local filesystem or shell tools."
+    elif account["provider"] == "command":
+        description += " Custom executable with full user permissions; its own implementation controls tools."
     return {
         "name": tool_name(agent),
         "description": " ".join(description.split()),
@@ -183,6 +187,23 @@ class McpServer:
     def _call(self, request_id: Any, params: dict[str, Any]) -> None:
         name = str(params.get("name") or "")
         arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            self.error(request_id, -32602, "tool arguments must be an object")
+            return
+        if name == "ticky_team":
+            from .team import run_team
+            try:
+                result = run_team(self.config, self.paths, arguments.get("agents"), arguments.get("task"),
+                                  mode=arguments.get("mode", "relay"), lead=arguments.get("lead"),
+                                  context=arguments.get("context"), profile_name=self.profile_name,
+                                  reason=arguments.get("reason"), boss=self.boss)
+                text, failed = result.text(), not result.ok
+            except (ConfigError, ValueError, TypeError) as error:
+                text, failed = f"team failed: {error}", True
+            except Exception:
+                text, failed = "team failed unexpectedly; unfinished calls were cancelled", True
+            self.reply(request_id, {"content": [{"type": "text", "text": text}], "isError": failed})
+            return
         if name == "ticky_roster":
             self.reply(request_id, {
                 "content": [{"type": "text", "text": roster_text(self.config, self.profile_name, self.paths)}],
@@ -251,7 +272,8 @@ class McpServer:
                     f"Active ticky profile: {self.profile_name}. Available agents: {tools or '(none)'}. "
                     f"Routing preferences: {routing}. "
                     "Each ask tool dispatches an independent subagent. Send a self-contained task and "
-                    "a specific one-line reason. Use ticky_roster when no agent is an obvious fit."
+                    "a specific one-line reason. Use ticky_roster when no agent is an obvious fit. "
+                    "Use ticky_team for a relay, parallel reviews, or synthesis across agents."
                 ),
             })
         elif method == "notifications/initialized":
@@ -264,6 +286,8 @@ class McpServer:
                 for agent in sorted(self.enabled_agents(), key=lambda item: (item["priority"], item["name"]))
             ]
             definitions.append(roster_definition())
+            from .team import team_definition
+            definitions.append(team_definition())
             self.reply(request_id, {"tools": definitions})
         elif method == "tools/call":
             self._workers = [worker for worker in self._workers if worker.is_alive()]
