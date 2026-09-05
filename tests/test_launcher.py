@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import unittest
 import os
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,7 +21,7 @@ class LauncherBehaviorTests(unittest.TestCase):
         self.assertNotIn('%PYTHON% "%~dp0ticky" account status', text)
         self.assertNotIn('%PYTHON% "%~dp0ticky" ui', text)
 
-    @unittest.skipIf(os.name == "nt", "macOS launcher requires zsh")
+    @unittest.skipUnless(sys.platform == "darwin", "macOS launcher is tested on macOS")
     def test_first_launch_delegates_setup_policy_to_start(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary, "checkout with spaces")
@@ -56,7 +57,7 @@ class LauncherBehaviorTests(unittest.TestCase):
                 ["start"],
             )
 
-    @unittest.skipIf(os.name == "nt", "macOS launcher requires zsh")
+    @unittest.skipUnless(sys.platform == "darwin", "macOS launcher is tested on macOS")
     def test_existing_config_uses_the_same_start_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary, "checkout")
@@ -91,7 +92,7 @@ class LauncherBehaviorTests(unittest.TestCase):
                 ["start"],
             )
 
-    @unittest.skipIf(os.name == "nt", "macOS launcher requires zsh")
+    @unittest.skipUnless(sys.platform == "darwin", "macOS launcher is tested on macOS")
     def test_finder_path_finds_grok_and_nvm_provider_clis(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary, "checkout")
@@ -133,7 +134,7 @@ class LauncherBehaviorTests(unittest.TestCase):
             self.assertIn(str(codex), result.stdout)
             self.assertIn(str(grok), result.stdout)
 
-    @unittest.skipIf(os.name == "nt", "macOS launcher requires zsh")
+    @unittest.skipUnless(sys.platform == "darwin", "macOS launcher is tested on macOS")
     def test_start_failure_is_visible_and_propagated(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary, "checkout with spaces")
