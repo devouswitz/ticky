@@ -46,7 +46,7 @@ class HarnessInstallTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 1, "", "add failed")
 
                 with (
-                    mock.patch.dict(os.environ, {"HOME": temporary}),
+                    mock.patch.dict(os.environ, {"HOME": temporary, "USERPROFILE": temporary}),
                     mock.patch("ticky_cli.harnesses.shutil.which", return_value=target),
                     mock.patch("ticky_cli.harnesses.executable_path", return_value="/tmp/ticky"),
                     mock.patch("ticky_cli.harnesses.subprocess.run", side_effect=run),
@@ -57,7 +57,8 @@ class HarnessInstallTests(unittest.TestCase):
                 self.assertIn("add failed", message)
                 self.assertIn("previous registration restored", message)
                 self.assertEqual(config_path.read_bytes(), original)
-                self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
+                if os.name != "nt":
+                    self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(len(commands), 2)
 
     def test_registration_process_error_restores_previous_config(self):
@@ -74,7 +75,7 @@ class HarnessInstallTests(unittest.TestCase):
                 raise OSError("could not start codex")
 
             with (
-                mock.patch.dict(os.environ, {"HOME": temporary}),
+                mock.patch.dict(os.environ, {"HOME": temporary, "USERPROFILE": temporary}),
                 mock.patch("ticky_cli.harnesses.shutil.which", return_value="codex"),
                 mock.patch("ticky_cli.harnesses.executable_path", return_value="/tmp/ticky"),
                 mock.patch("ticky_cli.harnesses.subprocess.run", side_effect=run),
@@ -103,7 +104,7 @@ class HarnessInstallTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             with (
-                mock.patch.dict(os.environ, {"HOME": temporary}),
+                mock.patch.dict(os.environ, {"HOME": temporary, "USERPROFILE": temporary}),
                 mock.patch("ticky_cli.harnesses.shutil.which", return_value="codex"),
                 mock.patch("ticky_cli.harnesses.executable_path", return_value="/tmp/ticky"),
                 mock.patch("ticky_cli.harnesses.subprocess.run", side_effect=run),

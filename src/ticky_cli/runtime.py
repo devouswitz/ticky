@@ -60,9 +60,37 @@ def locked_file(path: Path) -> Iterator[None]:
 
 def _pid_alive(pid: int) -> bool:
     try:
-        os.kill(int(pid), 0)
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            # Windows signal 0 is CTRL_C_EVENT, not a harmless POSIX probe.
+            import ctypes
+            from ctypes import wintypes
+            if pid > 0xFFFFFFFF:
+                return False
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+            kernel.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel.CloseHandle.restype = wintypes.BOOL
+            handle = kernel.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return ctypes.get_last_error() == 5  # Access denied is not proof of exit.
+            try:
+                code = wintypes.DWORD()
+                if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return True
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel.CloseHandle(handle)
+        os.kill(pid, 0)
         return True
-    except (OSError, ValueError):
+    except PermissionError:
+        return True
+    except (OSError, ValueError, TypeError, OverflowError):
         return False
 
 

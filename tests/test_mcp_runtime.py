@@ -14,10 +14,28 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from ticky_cli.config import AppPaths, account_record, agent_record, new_config
 from ticky_cli.mcp import McpServer
-from ticky_cli.runtime import append_log, read_log_tail, read_state, render_activity, write_state
+from ticky_cli.runtime import _pid_alive, append_log, read_log_tail, read_state, render_activity, write_state
 
 
 class McpAndActivityBehaviorTests(unittest.TestCase):
+    def test_pid_probe_preserves_a_live_process_and_detects_its_exit(self):
+        with subprocess.Popen(
+            [sys.executable, "-c", "import sys; print('ready', flush=True); print(sys.stdin.readline().strip())"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as process:
+            try:
+                self.assertEqual(process.stdout.readline().strip(), "ready")
+                self.assertTrue(_pid_alive(process.pid))
+                self.assertIsNone(process.poll())
+                stdout, stderr = process.communicate("still alive\n", timeout=10)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertEqual(stdout.strip(), "still alive")
+                self.assertFalse(_pid_alive(process.pid))
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=10)
+
     def mock_config(self):
         config = new_config([])
         config["accounts"]["mock-default"] = account_record("mock-default", "mock", "Mock")

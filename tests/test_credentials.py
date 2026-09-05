@@ -83,11 +83,13 @@ class CredentialTests(unittest.TestCase):
             for provider in ("claude", "gemini", "grok", "ollama"):
                 with self.subTest(provider=provider), mock.patch(
                     "ticky_cli.credentials.subprocess.run",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
                 ) as run:
                     account = account_record(f"{provider}-api", provider, auth="api-key")
                     ok, _ = set_api_key(paths, account, f"{provider}-secret")
                     self.assertTrue(ok)
-                    run.assert_not_called()
+                    # Windows uses a subprocess to apply the private file ACL.
+                    self.assertTrue(all(call.args[0][0] == "icacls" for call in run.call_args_list))
 
     def test_unset_uses_provider_default_name(self):
         with tempfile.TemporaryDirectory() as temporary:
