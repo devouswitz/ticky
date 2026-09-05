@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 CONFIG_VERSION = 2
-PROVIDERS = ("codex", "claude", "gemini", "grok", "ollama", "mock")
-SETUP_PROVIDERS = ("codex", "claude", "gemini", "grok", "ollama")
+PROVIDERS = ("codex", "claude", "gemini", "grok", "ollama", "api", "command", "mock")
+SETUP_PROVIDERS = ("codex", "claude", "gemini", "grok", "ollama", "api", "command")
 PROVIDER_ALIASES = {
     "anthropic": "claude",
     "chatgpt": "codex",
@@ -25,6 +25,8 @@ PROVIDER_ALIASES = {
     "local-llm": "ollama",
     "openai": "codex",
     "xai": "grok",
+    "http": "api",
+    "custom-cli": "command",
 }
 PROVIDER_EXECUTABLES = {
     "codex": "codex",
@@ -39,6 +41,8 @@ PROVIDER_KEY_NAMES = {
     "gemini": "GEMINI_API_KEY",
     "grok": "XAI_API_KEY",
     "ollama": "OLLAMA_API_KEY",
+    "api": "TICKY_API_KEY",
+    "command": "TICKY_API_KEY",
 }
 PROVIDER_LABELS = {
     "codex": "OpenAI Codex",
@@ -47,6 +51,8 @@ PROVIDER_LABELS = {
     "grok": "xAI Grok",
     "ollama": "Ollama local or cloud",
     "mock": "Mock test provider",
+    "api": "Direct API or compatible endpoint",
+    "command": "Custom CLI or adapter command",
 }
 AUTH_MODES = ("inherit", "isolated", "api-key")
 ACCESS_LEVELS = ("read-only", "workspace-write", "full")
@@ -174,7 +180,7 @@ def generated_agent_name(existing: Iterable[str], rng: random.Random | None = No
 def account_record(account_id: str, provider: str, label: str | None = None,
                    auth: str = "inherit", home: str | None = None) -> dict[str, Any]:
     provider = canonical_provider(provider)
-    return {
+    record = {
         "id": account_id,
         "label": label or account_id,
         "provider": provider,
@@ -182,6 +188,10 @@ def account_record(account_id: str, provider: str, label: str | None = None,
         "home": home,
         "enabled": True,
     }
+    if provider == "api":
+        from .api_provider import DEFAULT_ENDPOINTS
+        record["api"] = {"protocol": "openai-chat", "endpoint": DEFAULT_ENDPOINTS["openai-chat"]}
+    return record
 
 
 def agent_record(account_id: str, existing: Iterable[str] = (), *, name: str | None = None,
@@ -307,6 +317,19 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ConfigError(f"account {account_id!r} has unknown auth mode")
         if account.get("auth") == "api-key" and account.get("provider") == "mock":
             raise ConfigError("mock accounts do not support API-key authentication")
+        if account["provider"] == "api":
+            from .api_provider import validate_spec
+            try:
+                validate_spec(account.get("api"))
+            except ValueError as error:
+                raise ConfigError(f"account {account_id!r}: {error}") from error
+            if account.get("auth") == "isolated":
+                raise ConfigError("direct APIs use api-key or inherit authentication")
+        if account["provider"] == "command":
+            command = account.get("command")
+            if (not isinstance(command, list) or not command
+                    or not all(isinstance(value, str) and value and "\x00" not in value for value in command)):
+                raise ConfigError("custom command needs a non-empty argv list; no shell is used")
     for profile_name, profile in profiles.items():
         if not isinstance(profile, dict):
             raise ConfigError(f"profile {profile_name!r} must be an object")
@@ -328,6 +351,8 @@ def validate_config(config: dict[str, Any]) -> None:
                 raise ConfigError(f"agent {name!r} references missing account {agent.get('account')!r}")
             if agent.get("access") not in ACCESS_LEVELS:
                 raise ConfigError(f"agent {name!r} has invalid access")
+            if accounts[agent["account"]]["provider"] == "command" and agent["access"] != "full":
+                raise ConfigError("custom commands require explicit full access; ticky cannot sandbox an unknown CLI")
             if agent.get("thinking", "default") not in THINKING_LEVELS:
                 raise ConfigError(f"agent {name!r} has invalid thinking level")
             model = agent.get("model")

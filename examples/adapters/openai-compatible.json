@@ -1,0 +1,5 @@
+{
+  "protocol": "openai-chat",
+  "endpoint": "http://localhost:1234/v1/chat/completions",
+  "parameters": {}
+}

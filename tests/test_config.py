@@ -68,7 +68,7 @@ class ConfigBehaviorTests(unittest.TestCase):
 
     def _run(self, temporary, *arguments):
         return subprocess.run(
-            [str(TICKY), *arguments],
+            [sys.executable, str(TICKY), *arguments],
             cwd=ROOT,
             env=self._environment(temporary),
             text=True,
@@ -218,6 +218,14 @@ class ConfigBehaviorTests(unittest.TestCase):
             self.assertIn("codex CLI was not found", output.getvalue())
             self.assertIn("Ticky is opening", output.getvalue())
 
+    def test_noninteractive_generic_setup_does_not_save_unconfigured_accounts(self):
+        for provider in ("api", "command"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as temporary:
+                result = self._run(temporary, "setup", "--yes", "--provider", provider, "--no-install", "--no-link")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("connection details", result.stderr)
+                self.assertFalse(AppPaths(Path(temporary)).config.exists())
+
     def test_noninteractive_setup_adds_requested_provider_to_existing_config(self):
         with tempfile.TemporaryDirectory() as temporary:
             self._initialize(temporary, "codex")
@@ -290,15 +298,15 @@ class ConfigBehaviorTests(unittest.TestCase):
             original_name = config["profiles"]["default"]["agents"][0]["name"]
 
             created = subprocess.run(
-                [str(TICKY), "profile", "create", "review"],
+                [sys.executable, str(TICKY), "profile", "create", "review"],
                 cwd=ROOT, env=environment, text=True, capture_output=True, timeout=30,
             )
             used = subprocess.run(
-                [str(TICKY), "profile", "use", "review"],
+                [sys.executable, str(TICKY), "profile", "use", "review"],
                 cwd=ROOT, env=environment, text=True, capture_output=True, timeout=30,
             )
             edited = subprocess.run(
-                [str(TICKY), "agent", "edit", original_name, "specialty=Review only"],
+                [sys.executable, str(TICKY), "agent", "edit", original_name, "specialty=Review only"],
                 cwd=ROOT, env=environment, text=True, capture_output=True, timeout=30,
             )
             self.assertEqual(created.returncode, 0, created.stderr)

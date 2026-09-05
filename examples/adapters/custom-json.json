@@ -1,0 +1,12 @@
+{
+  "protocol": "custom",
+  "endpoint": "http://localhost:8080/generate",
+  "request": {
+    "model": "{model}",
+    "prompt": "{prompt}",
+    "stream": false
+  },
+  "response_pointer": "/response",
+  "auth_header": "Authorization",
+  "auth_prefix": "Bearer "
+}

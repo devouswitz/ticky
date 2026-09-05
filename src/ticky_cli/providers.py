@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import json
 import os
 import signal
 import subprocess
@@ -67,6 +68,14 @@ def account_environment(paths: AppPaths, account: dict[str, Any]) -> dict[str, s
         env.pop(key, None)
     auth = account.get("auth", "inherit")
     provider = account["provider"]
+    if provider == "api":
+        # A direct endpoint gets only its own key, never another account's or
+        # the shell's generic TICKY_API_KEY by accident.
+        env.pop("TICKY_API_KEY", None)
+        if auth == "api-key":
+            values = read_env_file(paths.account_env(account["id"]))
+            if values.get("TICKY_API_KEY"):
+                env["TICKY_API_KEY"] = values["TICKY_API_KEY"]
     provider_auth_keys = {
         "codex": ("OPENAI_API_KEY",),
         "claude": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
@@ -155,6 +164,33 @@ def build_invocation(paths: AppPaths, account: dict[str, Any], agent: dict[str, 
     env = account_environment(paths, account)
     extra_args = [str(value) for value in agent.get("extra_args") or []]
     validate_extra_args(extra_args)
+
+    if provider == "api":
+        from .api_provider import validate_spec
+        try:
+            validate_spec(account.get("api"))
+        except ValueError as error:
+            raise ConfigError(str(error)) from error
+        if not agent.get("model"):
+            raise ConfigError(f"API agent {agent['name']!r} needs a model; set one with /model")
+        if agent.get("thinking", "default") != "default":
+            raise ConfigError("direct API thinking options belong in the adapter's parameters; use default effort")
+        if account.get("auth") == "api-key" and not env.get("TICKY_API_KEY"):
+            raise ConfigError("API key is not set; use `ticky account key set " + account["id"] + "`")
+        command = [sys.executable, str(Path(__file__).with_name("api_provider.py"))]
+        payload = {"api": account["api"], "model": agent["model"], "prompt": prompt,
+                   "timeout": int(agent.get("timeout") or 900)}
+        return Invocation(command, cwd, env, stdin=json.dumps(payload))
+
+    if provider == "command":
+        if agent["access"] != "full":
+            raise ConfigError("custom commands require explicit full access")
+        command = [part.replace("{model}", str(agent.get("model") or ""))
+                   .replace("{thinking}", str(agent.get("thinking") or "default"))
+                   for part in account["command"]]
+        if not command:
+            raise ConfigError("custom command has no argv")
+        return Invocation(command, cwd, env, stdin=prompt)
 
     if provider == "codex":
         fd, output_name = tempfile.mkstemp(prefix="ticky-", suffix=".md")
@@ -360,6 +396,10 @@ def run_agent(paths: AppPaths, account: dict[str, Any], agent: dict[str, Any],
         _terminate_process_tree(process)
         _discard_output_file(invocation)
         return RunResult(False, f"timed out after {timeout}s", time.monotonic() - started)
+    except KeyboardInterrupt:
+        _terminate_process_tree(process)
+        _discard_output_file(invocation)
+        raise
 
     return _collect_result(invocation, process.returncode, stdout or "", stderr or "",
                            time.monotonic() - started)

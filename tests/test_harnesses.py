@@ -9,10 +9,16 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from ticky_cli.harnesses import install, server_command
+from ticky_cli.harnesses import install, mcp_json, server_command
 
 
 class HarnessInstallTests(unittest.TestCase):
+    def test_generic_export_preserves_custom_roster_home(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"TICKY_HOME": directory}):
+            exported = mcp_json("research")["mcpServers"]["ticky"]
+        self.assertEqual(exported["env"]["TICKY_HOME"], str(Path(directory).resolve()))
+        self.assertEqual(exported["args"][-2:], ["--profile", "research"])
+
     def test_windows_source_checkout_uses_python_for_mcp_server(self):
         command, arguments = server_command("research", platform="nt")
         self.assertEqual(command, sys.executable)

@@ -1,26 +1,26 @@
 <h1 align="center">ticky!</h1>
 
 <p align="center">
-  <strong>Turn your AI CLI accounts into named subagents that any MCP-capable harness can call.</strong>
+  <strong>Named AI agents across CLIs, APIs, and local models.</strong>
 </p>
 
 <p align="center">
-  A small, cross-platform dispatch layer for Codex, Claude Code, Gemini CLI, Grok, and Ollama.
+  One roster for terminal sessions and MCP hosts.
 </p>
 
 ---
 
-ticky lets Claude Code or Codex fan work out to a roster of named agents. Each agent has an account, model, thinking effort, tagline, routing note, work directory, and access policy. You describe an agent once and the boss harness can choose it naturally from that description.
+ticky connects provider CLIs, direct APIs, local endpoints, and custom adapters. Each named agent has an account, model, specialty, routing note, workspace, and access policy. An MCP host can dispatch individual agents or coordinate a team across providers.
 
 It is one Python 3.11+ package with no runtime dependencies, no Node layer, no daemon, and no provider SDKs. It runs on macOS, Linux, and Windows.
 
 ## A simple workflow
 
-1. **Install the provider CLIs** you want to use.
+1. **Install a provider CLI** or choose a direct API endpoint.
 2. **Run `ticky`** or double-click a launcher. First launch starts setup automatically.
-3. **Choose each account's authentication:** reuse a subscription login, open a separate login, or enter a private API key.
+3. **Connect an account:** reuse a CLI login, or enter an endpoint, model ID, and optional hidden API key.
 4. **Start with safe defaults** or choose full customization for names, models, effort, access, taglines, routing notes, and general directions.
-5. **Connect Codex or Claude Code** to ticky and restart the harness session.
+5. **Use the terminal session**, connect Codex or Claude Code, or export `ticky mcp-json` for another MCP host.
 
 The same guided setup is available at any time with `/setup` inside the interactive session.
 
@@ -36,7 +36,9 @@ cd ticky
 ./ticky                       # Windows PowerShell: py -3 ticky
 ```
 
-The first-run wizard defaults to quick setup. It generates account and agent names, keeps agents read-only, uses provider-default models, and leaves every detail editable through `/roster`, `/model`, or `/setup`. Ollama still asks for its required model name. Choose full customization when you want to review every field immediately. The wizard supports `codex`, `claude`, `gemini` (`google`), `grok` (`xai`), and `ollama` (`local`, `local-llm`). Provider CLIs are not bundled. Install the ones you want from their official projects: [Codex](https://github.com/openai/codex), [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Grok](https://grok.com), or [Ollama](https://ollama.com/download).
+The first-run wizard defaults to quick setup. It generates account and agent names and leaves details editable through `/roster`, `/model`, or `/setup`. Choose a provider CLI, a direct `api` connection, or a custom `command` bridge. API and Ollama agents ask for a model ID; other providers can use their defaults. Agents default to read-only, except custom commands, which require explicit full access. Choose full customization to review every field.
+
+Provider CLIs are optional and are not bundled. Built-in adapters support [Codex](https://github.com/openai/codex), [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Grok](https://grok.com), and [Ollama](https://ollama.com/download). Aliases include `google`, `xai`, `local`, and `local-llm`.
 
 Setup can also be run directly:
 
@@ -55,6 +57,50 @@ For a noninteractive seed:
 
 This creates inherited-login account and agent defaults without asking for secrets or choosing an Ollama model. Use interactive setup for those steps, or set them later with `ticky account key set` and `/model`. `ticky init` remains an alias for older scripts.
 
+## Direct APIs and custom providers
+
+Choose `api` in `ticky setup` for a direct connection without a provider CLI. The wizard asks for the protocol, complete endpoint URL, model ID, and optional hidden key. Model names are free-form.
+
+| Adapter | Use |
+| --- | --- |
+| `openai-chat` | OpenAI Chat Completions and compatible hosted or local endpoints |
+| `openai-responses` | OpenAI Responses |
+| `anthropic` | Anthropic Messages |
+| `gemini` | Gemini generateContent |
+| `custom` | A JSON request template and response text mapping |
+| `command` | Any executable or SDK bridge that reads a prompt on stdin and returns text on stdout |
+
+For scripts, create an account and agent directly:
+
+```sh
+ticky account add --id local-api --provider api --auth inherit \
+  --protocol openai-chat --endpoint http://localhost:1234/v1/chat/completions
+ticky agent add reviewer --account local-api --model your-model-id --access read-only
+ticky call reviewer "Review this design" --context "Design details here"
+```
+
+Use `--auth api-key` and `ticky account key set ACCOUNT` for an authenticated endpoint. Keys stay in the selected account's private credential file. Ticky never borrows another API account's key, follows API redirects, or retries a potentially billable generation automatically.
+
+Use `--adapter examples/adapters/custom-json.json` with `account add` for another JSON protocol. The file defines `endpoint`, `protocol`, optional `headers` and `parameters`, a `request` template using `{model}` and `{prompt}`, and a `response_pointer` using JSON Pointer syntax. Vendor-specific settings, including thinking and output limits, belong in `parameters`. Direct API calls return text and have no local shell or filesystem tools.
+
+For a provider with a different transport, authentication SDK, streaming-only interface, or tool runtime, choose `command` in setup or pass `--provider command --argv '["my-ai", "--model", "{model}"]'` to `account add`. Ticky starts that argv directly, with no shell, and supplies the prompt on stdin. `{thinking}` is also available in argv. Custom commands require explicit `full` access because their own implementation controls tools and permissions.
+
+HTTP is supported on loopback addresses for local models; remote endpoints use HTTPS. Adapter support is protocol-based: model-specific capabilities and proprietary services depend on the selected endpoint or bridge.
+
+## Cross-provider teams
+
+```sh
+# Each agent receives the earlier contributions.
+ticky team builder,reviewer "Review the implementation and propose corrections"
+
+# Independent reviews, followed by one synthesis call.
+ticky team reviewer,researcher "Assess the design" --mode parallel --lead editor
+```
+
+Inside a session, `/team builder,reviewer task` runs a relay. An MCP host can call `ticky_team` with agent names, a task, a reason, an optional mode, and an optional lead. Teams use the same credentials, workspace settings, and activity history as individual calls. Any configured provider can contribute or synthesize.
+
+Teams make one call per selected agent and one optional lead call. Parallel contributors must be read-only; use relay for agents that write. A failed relay stops before downstream agents run. Failed parallel contributions stay labelled in the output, and Ctrl+C cancels unfinished calls.
+
 ## The roster
 
 | Agent | Account | Carries | Safety |
@@ -71,9 +117,11 @@ Each call takes a complete task and a one-line reason. Optional context can carr
 
 `ticky start` opens a persistent terminal session with a bordered prompt, streaming provider output, and background activity notifications. Running bare `ticky` in a terminal uses the same smart start path. `ticky ui` remains available when you explicitly want the session without first-run setup.
 
-- Plain text goes to the best-fitting enabled agent.
+- Plain text goes to the enabled agent with the lowest priority number. An MCP boss chooses from the agent descriptions itself.
 - `@name task` targets one agent; `/use <name>` pins plain tasks to it.
-- Follow-ups to the same agent carry recent exchanges; `/new` resets that context.
+- Follow-ups carry recent exchanges within the same profile, agent, account, model, workspace, and access level; `/new` resets that context.
+- `/paste [agent]` collects a multiline task, including blank lines and indentation. `/send` on its own line runs it once; `/cancel` discards it.
+- Tab completes commands, agent names, profile names, and thinking effort where relevant.
 - `ctrl+c` interrupts a running agent without leaving the session.
 - Config edits made by the session or another terminal are picked up live.
 
@@ -83,6 +131,7 @@ Useful slash commands:
 /setup                         guided accounts, keys, models, and directions
 /agents                        show the active roster
 /model <agent> [model] [effort] change a model or thinking effort
+/paste [agent]                 compose a multiline task
 /tagline <agent> [text]        show or change the routing specialty
 /roster                        edit the roster without leaving the session
 /profile <name>                switch profiles
@@ -236,6 +285,8 @@ Start Ticky.command           macOS one-click wrapper around ticky start
 Start Ticky.cmd               Windows one-click wrapper around ticky start
 src/ticky_cli/config.py       schemas, migration, accounts, profiles, and agents
 src/ticky_cli/providers.py    provider command adapters and subprocess handling
+src/ticky_cli/api_provider.py direct JSON API protocols and custom mappings
+src/ticky_cli/team.py         relay, parallel contributions, and synthesis
 src/ticky_cli/credentials.py  private API-key storage and activation
 src/ticky_cli/ollama_api.py   dependency-free Ollama Cloud API-key client
 src/ticky_cli/setup_wizard.py guided account and roster setup
